@@ -33,6 +33,7 @@
 #include "llvm/IR/User.h"
 #include "llvm/Support/AtomicOrdering.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/IR/Operator.h"
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -1149,6 +1150,13 @@ public:
   static bool classof(const Value *V) {
     return isa<Instruction>(V) && classof(cast<Instruction>(V));
   }
+
+  /// Determine two GEPs have different offset if possible.
+  ///
+  /// In general, the offset of two GEPs cannot be calculated perfectly
+  /// because of past-the-end. However, in certain cases, the same and
+  /// different can be determined.
+  bool hasDifferOffset(const DataLayout &DL, const GEPOperator &GEP) const;
 };
 
 template <>

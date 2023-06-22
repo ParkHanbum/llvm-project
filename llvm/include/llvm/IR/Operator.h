@@ -512,6 +512,13 @@ public:
   bool collectOffset(const DataLayout &DL, unsigned BitWidth,
                      MapVector<Value *, APInt> &VariableOffsets,
                      APInt &ConstantOffset) const;
+
+  /// Determine two GEPs have different offset if possible.
+  ///
+  /// In general, the offset of two GEPs cannot be calculated perfectly
+  /// because of past-the-end. However, in certain cases, the same and
+  /// different can be determined.
+  bool hasDifferOffset(const DataLayout &DL, const GEPOperator &GEP) const;
 };
 
 class PtrToIntOperator

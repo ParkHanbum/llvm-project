@@ -1544,15 +1544,12 @@ static ICmpInst::Predicate evaluateICmpRelation(Constant *V1, Constant *V2,
         // By far the most common case to handle is when the base pointers are
         // obviously to the same global.
         const Constant *CE2Op0 = cast<Constant>(CE2GEP->getPointerOperand());
-        if (isa<GlobalValue>(CE1Op0) && isa<GlobalValue>(CE2Op0)) {
-          // Don't know relative ordering, but check for inequality.
-          if (CE1Op0 != CE2Op0) {
-            if (CE1GEP->hasAllZeroIndices() && CE2GEP->hasAllZeroIndices())
-              return areGlobalsPotentiallyEqual(cast<GlobalValue>(CE1Op0),
-                                                cast<GlobalValue>(CE2Op0));
-            return ICmpInst::BAD_ICMP_PREDICATE;
-          }
-        }
+        DataLayout DL(dyn_cast<GlobalValue>(CE1Op0)->getParent());
+        if (CE1GEP->hasDifferOffset(DL, *CE2GEP))
+          return areGlobalsPotentiallyEqual(cast<GlobalValue>(CE1Op0),
+                                            cast<GlobalValue>(CE2Op0));
+
+        return ICmpInst::BAD_ICMP_PREDICATE;
       }
       break;
     }

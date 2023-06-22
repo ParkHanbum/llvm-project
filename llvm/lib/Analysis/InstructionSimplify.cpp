@@ -3757,12 +3757,25 @@ static Value *simplifyICmpInst(unsigned Predicate, Value *LHS, Value *RHS,
   if (Value *V = simplifyICmpWithConstant(Pred, LHS, RHS, Q.IIQ))
     return V;
 
-  // If both operands have range metadata, use the metadata
-  // to simplify the comparison.
   if (isa<Instruction>(RHS) && isa<Instruction>(LHS)) {
     auto RHS_Instr = cast<Instruction>(RHS);
     auto LHS_Instr = cast<Instruction>(LHS);
 
+    // GetElementPtrInst specific logic
+    if (ICmpInst::isEquality(Pred) && isa<GEPOperator>(LHS) &&
+        isa<GEPOperator>(RHS)) {
+      DataLayout DL(LHS_Instr->getModule());
+      const auto GEP1 = dyn_cast<GEPOperator>(LHS);
+      const auto GEP2 = dyn_cast<GEPOperator>(RHS);
+
+      if (haveNonOverlappingStorage(GEP1->getPointerOperand(),
+                                    GEP2->getPointerOperand()))
+        if (GEP1->hasDifferOffset(DL, *GEP2))
+          return Pred == ICmpInst::ICMP_NE ? getTrue(ITy) : getFalse(ITy);
+    }
+
+    // If both operands have range metadata, use the metadata
+    // to simplify the comparison.
     if (Q.IIQ.getMetadata(RHS_Instr, LLVMContext::MD_range) &&
         Q.IIQ.getMetadata(LHS_Instr, LLVMContext::MD_range)) {
       auto RHS_CR = getConstantRangeFromMetadata(

@@ -1974,6 +1974,12 @@ bool GetElementPtrInst::collectOffset(
                                                 ConstantOffset);
 }
 
+bool GetElementPtrInst::hasDifferOffset(const DataLayout &DL,
+                                        const GEPOperator &GEP) const {
+  // Delegate to the generic GEPOperator implementation.
+  return cast<GEPOperator>(this)->hasDifferOffset(DL, GEP);
+}
+
 //===----------------------------------------------------------------------===//
 //                           ExtractElementInst Implementation
 //===----------------------------------------------------------------------===//

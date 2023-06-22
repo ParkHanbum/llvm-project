@@ -232,6 +232,33 @@ bool GEPOperator::collectOffset(
   return true;
 }
 
+bool GEPOperator::hasDifferOffset(const DataLayout &DL,
+                                  const GEPOperator &GEP) const {
+  auto GEP1ptr = getPointerOperand();
+  auto GEP2ptr = GEP.getPointerOperand();
+
+  if (GEP1ptr != GEP2ptr) {
+    if ((hasIndices() && hasAllConstantIndices()) &&
+        (GEP.hasIndices() && GEP.hasAllConstantIndices())) {
+
+      if (hasAllZeroIndices() && GEP.hasAllZeroIndices())
+        return true;
+
+      unsigned BitWidth = DL.getIndexTypeSizeInBits(getType());
+      APInt GEP1Offset(BitWidth, 0);
+      BitWidth = DL.getIndexTypeSizeInBits(GEP.getType());
+      APInt GEP2Offset(BitWidth, 0);
+      accumulateConstantOffset(DL, GEP1Offset);
+      GEP.accumulateConstantOffset(DL, GEP2Offset);
+
+      if (GEP1Offset == GEP2Offset)
+        return true;
+    }
+  }
+
+  return false;
+}
+
 void FastMathFlags::print(raw_ostream &O) const {
   if (all())
     O << " fast";
