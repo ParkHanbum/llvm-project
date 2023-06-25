@@ -2794,11 +2794,13 @@ static Constant *computePointerICmp(CmpInst::Predicate Pred, Value *LHS,
       }(LHS);
       Opts.NullIsUnknownSize = F ? NullPointerIsDefined(F) : true;
       if (getObjectSize(LHS, LHSSize, DL, TLI, Opts) &&
-          getObjectSize(RHS, RHSSize, DL, TLI, Opts) &&
-          !LHSOffset.isNegative() && !RHSOffset.isNegative() &&
-          LHSOffset.ult(LHSSize) && RHSOffset.ult(RHSSize)) {
-        return ConstantInt::get(getCompareTy(LHS),
-                                !CmpInst::isTrueWhenEqual(Pred));
+          getObjectSize(RHS, RHSSize, DL, TLI, Opts)) {
+        APInt dist;
+        dist = LHSOffset - RHSOffset;
+        dist = dist.abs();
+        if (dist.ult(LHSSize) && dist.ult(RHSSize))
+          return ConstantInt::get(getCompareTy(LHS),
+                                  !CmpInst::isTrueWhenEqual(Pred));
       }
     }
 

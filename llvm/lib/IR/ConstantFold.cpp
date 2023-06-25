@@ -1547,9 +1547,27 @@ static ICmpInst::Predicate evaluateICmpRelation(Constant *V1, Constant *V2,
         if (isa<GlobalValue>(CE1Op0) && isa<GlobalValue>(CE2Op0)) {
           // Don't know relative ordering, but check for inequality.
           if (CE1Op0 != CE2Op0) {
-            if (CE1GEP->hasAllZeroIndices() && CE2GEP->hasAllZeroIndices())
+            DataLayout DL(cast<GlobalValue>(CE1Op0)->getParent());
+            Type *GVT;
+            unsigned BitWidth;
+            APInt dist;
+            GVT = CE1Op0->getType();
+            auto CE1Op0Size = DL.getTypeAllocSize(GVT);
+            GVT = CE2Op0->getType();
+            auto CE2Op0Size = DL.getTypeAllocSize(GVT);
+            BitWidth = DL.getIndexTypeSizeInBits(cast<GlobalValue>(CE1Op0)->getValueType());
+            APInt CE1GEPOffset(BitWidth, 0);
+            BitWidth = DL.getIndexTypeSizeInBits(cast<GlobalValue>(CE2Op0)->getValueType());
+            APInt CE2GEPOffset(BitWidth, 0);
+            CE1GEP->accumulateConstantOffset(DL, CE1GEPOffset);
+            CE2GEP->accumulateConstantOffset(DL, CE2GEPOffset);
+
+            dist = CE1GEPOffset - CE2GEPOffset;
+            dist = dist.abs();
+            if (dist.ult(CE1Op0Size) && dist.ult(CE2Op0Size))
               return areGlobalsPotentiallyEqual(cast<GlobalValue>(CE1Op0),
                                                 cast<GlobalValue>(CE2Op0));
+
             return ICmpInst::BAD_ICMP_PREDICATE;
           }
         }
