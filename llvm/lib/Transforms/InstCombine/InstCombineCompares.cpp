@@ -3382,15 +3382,50 @@ Instruction *InstCombinerImpl::foldICmpBinOpEqualityWithConstant(
       }
     }
     break;
+  case Instruction::And: {
+    Value *A, *B;
+    if (BO->hasOneUse() && match(BOp0, m_ZExtOrSExt(m_Value(A))) &&
+        match(BOp1, m_ZExtOrSExt(m_Value(B))) &&
+        A->getType()->isIntOrIntVectorTy(1) &&
+        B->getType()->isIntOrIntVectorTy(1)) {
+      LLVM_DEBUG(dbgs() << "match icmp eq/ne (and (ext (i1 A)), (ext (i1 B))");
+      auto NewBinOp =
+          BinaryOperator::Create(BO->getOpcode(), A, B, BO->getName());
+      Builder.Insert(NewBinOp);
+      if ((!isICMP_NE && C.isZero()) || (isICMP_NE && C.isOne())) {
+        NewBinOp = BinaryOperator::CreateNot(NewBinOp);
+        Builder.Insert(NewBinOp);
+      }
+      return replaceInstUsesWith(Cmp, NewBinOp);
+    }
+    break;
+  }
   case Instruction::Or: {
+    Value *A, *B;
     const APInt *BOC;
-    if (match(BOp1, m_APInt(BOC)) && BO->hasOneUse() && RHS->isAllOnesValue()) {
-      // Comparing if all bits outside of a constant mask are set?
-      // Replace (X | C) == -1 with (X & ~C) == ~C.
-      // This removes the -1 constant.
-      Constant *NotBOC = ConstantExpr::getNot(cast<Constant>(BOp1));
-      Value *And = Builder.CreateAnd(BOp0, NotBOC);
-      return new ICmpInst(Pred, And, NotBOC);
+    if (BO->hasOneUse()) {
+      if (match(BOp1, m_APInt(BOC)) && RHS->isAllOnesValue()) {
+        // Comparing if all bits outside of a constant mask are set?
+        // Replace (X | C) == -1 with (X & ~C) == ~C.
+        // This removes the -1 constant.
+        Constant *NotBOC = ConstantExpr::getNot(cast<Constant>(BOp1));
+        Value *And = Builder.CreateAnd(BOp0, NotBOC);
+        return new ICmpInst(Pred, And, NotBOC);
+      }
+      if (match(BOp0, m_ZExtOrSExt(m_Value(A))) &&
+          match(BOp1, m_ZExtOrSExt(m_Value(B))) &&
+          A->getType()->isIntOrIntVectorTy(1) &&
+          B->getType()->isIntOrIntVectorTy(1)) {
+        LLVM_DEBUG(dbgs() << "match icmp eq/ne (or (ext (i1 A)), (ext (i1 B))");
+        auto NewBinOp =
+            BinaryOperator::Create(BO->getOpcode(), A, B, BO->getName());
+        Builder.Insert(NewBinOp);
+        if ((!isICMP_NE && C.isZero()) || (isICMP_NE && C.isOne())) {
+          NewBinOp = BinaryOperator::CreateNot(NewBinOp);
+          Builder.Insert(NewBinOp);
+        }
+        return replaceInstUsesWith(Cmp, NewBinOp);
+      }
     }
     break;
   }
