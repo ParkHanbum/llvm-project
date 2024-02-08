@@ -1713,6 +1713,248 @@ Instruction *InstCombinerImpl::foldSelectInstWithICmp(SelectInst &SI,
     }
   }
 
+  // Specialized cases of 
+  // Transform (X == C) ? X op Z : Y -> (X == C) ? C op Z : Y
+  // https://alive2.llvm.org/ce/z/bguSQF
+  // x&y -> (x|y) & ~(x^y)
+  // x|y -> (x&y) |  (x^y)
+  // x^y -> (x|y) & ~(x&y)
+  // X&Y==0 ? X|Y : X^Y --> X&Y==0 ? X^Y : X^Y
+  // X&Y==0 ? X^Y : X|Y --> X&Y==0 ? X|Y : X|Y
+  Value *X, *Y;
+
+  auto SimplifySelect = [&](Value *Cond, Value *NewTV, Value *FV,
+                            SimplifyQuery &SQ) -> Value * {
+    Value *Ret;
+    if ((Ret = simplifySelectInst(Cond, NewTV, FV, SQ)))
+      Ret = Ret != NewTV ? Ret : nullptr;
+    LLVM_DEBUG(dbgs() << "1       :" << NewTV->getNumUses());
+    if (isa<Instruction>(NewTV))
+      NewTV->deleteValue();
+    return Ret;
+  };
+
+  LLVM_DEBUG(dbgs() << "???  :");
+
+  if (match(CmpLHS, m_BinOp(m_Value(X), m_Value(Y))) &&
+      match(TrueVal, m_BinOp(m_Deferred(X), m_Deferred(Y)))) {
+    LLVM_DEBUG(dbgs() << "BinOp!  : "; CmpLHS->dump());
+
+    BinaryOperator *BinOpLHS = cast<BinaryOperator>(CmpLHS);
+    BinaryOperator *BinOpTV = cast<BinaryOperator>(TrueVal);
+
+    BinaryOperator::BinaryOps BinOpLHSCode = BinOpLHS->getOpcode();
+    BinaryOperator::BinaryOps BinOpTVCode = BinOpTV->getOpcode();
+
+
+    // handle more 
+    if (BinOpLHSCode == BinaryOperator::And) {
+    if (BinOpTVCode == BinaryOperator::Or) {
+        // x|y -> (x&y) | (x^y) -> CmpRHS | (x^y)
+        auto *Xor = BinaryOperator::CreateXor(X, Y);
+        // auto *Or = BinaryOperator::CreateOr(CmpRHS, Xor);
+        // InsertNewInstBefore(cast<Instruction>(Xor), SI.getIterator());
+        if (Value *NewTV = simplifyOrInst(CmpRHS, Xor, SQ)) {
+          LLVM_DEBUG(dbgs() << "V   :"; NewTV->dump(););
+          if (Value *V = SimplifySelect(ICI, NewTV, FalseVal, SQ)) {
+            LLVM_DEBUG(dbgs() << "V   :"; V->dump(););
+            return replaceInstUsesWith(SI, V);
+          }
+          if (NewTV != Xor) {
+            LLVM_DEBUG(dbgs() << "NewTV  not Xor :  "; NewTV->dump());
+            SI.setOperand(1, NewTV);
+            Changed = true;
+          }
+        } else {
+          Xor->deleteValue();
+        }
+      }
+      if (BinOpTVCode == BinaryOperator::Xor) {
+        // x^y -> (x|y) & ~(x&y) -> (x|y) & ~(CmpRHS)
+        Value *Or = BinaryOperator::CreateOr(X, Y);
+        Value *NCmpRHS = BinaryOperator::CreateNot(CmpRHS);
+        if (Value *NewTV = simplifyAndInst(Or, NCmpRHS, SQ)) {
+          LLVM_DEBUG(dbgs() << "V   :"; NewTV->dump(););
+          if (Value *V = SimplifySelect(ICI, NewTV, FalseVal, SQ)) {
+            LLVM_DEBUG(dbgs() << "V   :" << V->getNumUses(); V->dump(););
+            return replaceInstUsesWith(SI, V);
+          }
+          // NewTV->deleteValue();
+          LLVM_DEBUG(dbgs() << "2       :" << NCmpRHS->getNumUses());
+          NCmpRHS->deleteValue();
+          LLVM_DEBUG(dbgs() << "3       :" << Or->getNumUses());
+          // Or->deleteValue();
+          LLVM_DEBUG(dbgs() << "4       :" << NewTV->getNumUses());
+        }
+      }
+    } else if (BinOpLHSCode == BinaryOperator::Or) {
+      if (BinOpTVCode == BinaryOperator::And) {
+        // x&y -> (x|y) & ~(x^y) -> CmpRHS & ~(x^y)
+        Value *Xor = BinaryOperator::CreateXor(X, Y);
+        Value *NXor = BinaryOperator::CreateNot(Xor);
+        if (Value *NewTV = simplifyAndInst(CmpRHS, NXor, SQ)) {
+          LLVM_DEBUG(dbgs() << "V   :"; NewTV->dump(););
+          if (Value *V = SimplifySelect(ICI, NewTV, FalseVal, SQ)) {
+            LLVM_DEBUG(dbgs() << "V   :" << V->getNumUses(); V->dump(););
+            return replaceInstUsesWith(SI, V);
+          }
+          LLVM_DEBUG(dbgs() << "2       :" << NXor->getNumUses());
+          NXor->deleteValue();
+          LLVM_DEBUG(dbgs() << "3       :" << Xor->getNumUses());
+          Xor->deleteValue();
+        }
+      }
+      if (BinOpTVCode == BinaryOperator::Xor) {
+        // x^y -> (x|y) & ~(x&y) -> CmpRHS & ~(x&y)
+        Value *And = BinaryOperator::CreateAnd(X, Y);
+        Value *NAnd = BinaryOperator::CreateNot(And);
+        if (Value *NewTV = simplifyAndInst(CmpRHS, NAnd, SQ)) {
+          LLVM_DEBUG(dbgs() << "V   :"; NewTV->dump(););
+          if (Value *V = SimplifySelect(ICI, NewTV, FalseVal, SQ)) {
+            LLVM_DEBUG(dbgs() << "V   :" << V->getNumUses(); V->dump(););
+            return replaceInstUsesWith(SI, V);
+          }
+          LLVM_DEBUG(dbgs() << "2       :" << NAnd->getNumUses());
+          NAnd->deleteValue();
+          LLVM_DEBUG(dbgs() << "3       :" << And->getNumUses());
+          And->deleteValue();
+        }
+      }
+    } else if (BinOpLHSCode == BinaryOperator::Xor) {
+      if (BinOpTVCode == BinaryOperator::And) {
+        // x&y -> (x|y) & ~(x^y) -> (x|y) & ~CmpRHS
+        Value *Or = BinaryOperator::CreateOr(X, Y);
+        Value *NCmpRHS = BinaryOperator::CreateNot(CmpRHS);
+        if (Value *NewTV = simplifyAndInst(Or, NCmpRHS, SQ)) {
+          LLVM_DEBUG(dbgs() << "V   :"; NewTV->dump(););
+          if (Value *V = SimplifySelect(ICI, NewTV, FalseVal, SQ)) {
+            LLVM_DEBUG(dbgs() << "V   :" << V->getNumUses(); V->dump(););
+            return replaceInstUsesWith(SI, V);
+          }
+          LLVM_DEBUG(dbgs() << "2       :" << NCmpRHS->getNumUses());
+          NCmpRHS->deleteValue();
+          LLVM_DEBUG(dbgs() << "3       :" << Or->getNumUses());
+          Or->deleteValue();
+        }
+      }
+      if (BinOpTVCode == BinaryOperator::Or) {
+        // x|y -> (x&y) | (x^y) -> (x&y) | CmpRHS
+        Value *And = BinaryOperator::CreateAnd(X, Y);
+        if (Value *NewTV = simplifyOrInst(And, CmpRHS, SQ)) {
+          LLVM_DEBUG(dbgs() << "V   :"; NewTV->dump(););
+          if (Value *V = SimplifySelect(ICI, NewTV, FalseVal, SQ)) {
+            LLVM_DEBUG(dbgs() << "V   :" << V->getNumUses(); V->dump(););
+            return replaceInstUsesWith(SI, V);
+          }
+          LLVM_DEBUG(dbgs() << "2       :" << And->getNumUses());
+          And->deleteValue();
+        }
+      }
+    } else {
+      LLVM_DEBUG(dbgs() << "Normal cases    : ");
+    }
+  }
+
+/* 
+  if (match(CmpLHS, m_And(m_Value(X), m_Value(Y)))) {
+    if (match(TrueVal, m_c_Or(m_Specific(X), m_Specific(Y)))) {
+      // x|y -> (x&y) | (x^y) -> CmpRHS | (x^y)
+      auto *Xor = BinaryOperator::CreateXor(X, Y);
+      // auto *Or = BinaryOperator::CreateOr(CmpRHS, Xor);
+      // InsertNewInstBefore(cast<Instruction>(Xor), SI.getIterator());
+      if (Value *NewTV = simplifyOrInst(CmpRHS, Xor, SQ)) {
+        LLVM_DEBUG(dbgs() << "V   :"; NewTV->dump(););
+        if (Value *V = SimplifySelect(ICI, NewTV, FalseVal, SQ)) {
+          LLVM_DEBUG(dbgs() << "V   :"; V->dump(););
+          return replaceInstUsesWith(SI, V);
+        }
+      }
+    } else if (match(TrueVal, m_c_Xor(m_Specific(X), m_Specific(Y)))) {
+      // x^y -> (x|y) & ~(x&y) -> (x|y) & ~(CmpRHS)
+      Value *Or = BinaryOperator::CreateOr(X, Y);
+      Value *NCmpRHS = BinaryOperator::CreateNot(CmpRHS);
+      if (Value *NewTV = simplifyAndInst(Or, NCmpRHS, SQ)) {
+        LLVM_DEBUG(dbgs() << "V   :"; NewTV->dump(););
+        if (Value *V = SimplifySelect(ICI, NewTV, FalseVal, SQ)) {
+          LLVM_DEBUG(dbgs() << "V   :" << V->getNumUses(); V->dump(););
+          return replaceInstUsesWith(SI, V);
+        }
+        // NewTV->deleteValue();
+        LLVM_DEBUG(dbgs() << "2       :" << NCmpRHS->getNumUses());
+        NCmpRHS->deleteValue();
+        LLVM_DEBUG(dbgs() << "3       :" << Or->getNumUses());
+        // Or->deleteValue();
+        LLVM_DEBUG(dbgs() << "4       :" << NewTV->getNumUses());
+      }
+    }
+  } else if (match(CmpLHS, m_Or(m_Value(X), m_Value(Y)))) {
+    if (match(TrueVal, m_c_And(m_Specific(X), m_Specific(Y)))) {
+      // x&y -> (x|y) & ~(x^y) -> CmpRHS & ~(x^y)
+      Value *Xor = BinaryOperator::CreateXor(X, Y);
+      Value *NXor = BinaryOperator::CreateNot(Xor);
+      if (Value *NewTV = simplifyAndInst(CmpRHS, NXor, SQ)) {
+        LLVM_DEBUG(dbgs() << "V   :"; NewTV->dump(););
+        if (Value *V = SimplifySelect(ICI, NewTV, FalseVal, SQ)) {
+          LLVM_DEBUG(dbgs() << "V   :" << V->getNumUses(); V->dump(););
+          return replaceInstUsesWith(SI, V);
+        }
+        LLVM_DEBUG(dbgs() << "2       :" << NXor->getNumUses());
+        NXor->deleteValue();
+        LLVM_DEBUG(dbgs() << "3       :" << Xor->getNumUses());
+        Xor->deleteValue();
+      }
+    } else if (match(TrueVal, m_c_Xor(m_Specific(X), m_Specific(Y)))) {
+      // x^y -> (x|y) & ~(x&y) -> CmpRHS & ~(x&y)
+      Value *And = BinaryOperator::CreateAnd(X, Y);
+      Value *NAnd = BinaryOperator::CreateNot(And);
+      if (Value *NewTV = simplifyAndInst(CmpRHS, NAnd, SQ)) {
+        LLVM_DEBUG(dbgs() << "V   :"; NewTV->dump(););
+        if (Value *V = SimplifySelect(ICI, NewTV, FalseVal, SQ)) {
+          LLVM_DEBUG(dbgs() << "V   :" << V->getNumUses(); V->dump(););
+          return replaceInstUsesWith(SI, V);
+        }
+
+        LLVM_DEBUG(dbgs() << "2       :" << NAnd->getNumUses());
+        NAnd->deleteValue();
+        LLVM_DEBUG(dbgs() << "3       :" << And->getNumUses());
+        And->deleteValue();
+      }
+    }
+  } 
+  else if (match(CmpLHS, m_Xor(m_Value(X), m_Value(Y)))) {
+    if (match(TrueVal, m_c_And(m_Specific(X), m_Specific(Y)))) {
+      // x&y -> (x|y) & ~(x^y) -> (x|y) & ~CmpRHS
+      Value *Or = BinaryOperator::CreateOr(X, Y);
+      Value *NCmpRHS = BinaryOperator::CreateNot(CmpRHS);
+      if (Value *NewTV = simplifyAndInst(Or, NCmpRHS, SQ)) {
+        LLVM_DEBUG(dbgs() << "V   :"; NewTV->dump(););
+        if (Value *V = SimplifySelect(ICI, NewTV, FalseVal, SQ)) {
+          LLVM_DEBUG(dbgs() << "V   :" << V->getNumUses(); V->dump(););
+          return replaceInstUsesWith(SI, V);
+        }
+        LLVM_DEBUG(dbgs() << "2       :" << NCmpRHS->getNumUses());
+        NCmpRHS->deleteValue();
+        LLVM_DEBUG(dbgs() << "3       :" << Or->getNumUses());
+        Or->deleteValue();
+      }
+    } else if (match(TrueVal, m_c_Or(m_Specific(X), m_Specific(Y)))) {
+      // x|y -> (x&y) | (x^y) -> (x&y) | CmpRHS
+      Value *And = BinaryOperator::CreateAnd(X, Y);
+      if (Value *NewTV = simplifyOrInst(And, CmpRHS, SQ)) {
+        LLVM_DEBUG(dbgs() << "V   :"; NewTV->dump(););
+        if (Value *V = SimplifySelect(ICI, NewTV, FalseVal, SQ)) {
+          LLVM_DEBUG(dbgs() << "V   :" << V->getNumUses(); V->dump(););
+          return replaceInstUsesWith(SI, V);
+        }
+        LLVM_DEBUG(dbgs() << "2       :" << And->getNumUses());
+        And->deleteValue();
+      }
+    }
+  } else {
+    // we handled special cases. now do same thing to normal form`
+  }
+  */
+
   // Canonicalize a signbit condition to use zero constant by swapping:
   // (CmpLHS > -1) ? TV : FV --> (CmpLHS < 0) ? FV : TV
   // To avoid conflicts (infinite loops) with other canonicalizations, this is

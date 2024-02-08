@@ -4352,6 +4352,7 @@ static Value *simplifyWithOpReplaced(Value *V, Value *Op, Value *RepOp,
         return NewOps[0];
 
       // x & x -> x, x | x -> x
+      LLVM_DEBUG(dbgs() << "ANDOR :  "; I->dump());
       if ((Opcode == Instruction::And || Opcode == Instruction::Or) &&
           NewOps[0] == NewOps[1]) {
         // or disjoint x, x results in poison.
@@ -4636,9 +4637,9 @@ static Value *simplifySelectWithICmpEq(Value *CmpLHS, Value *CmpRHS,
                              /* DropFlags */ nullptr, MaxRecurse) == FalseVal)
     return FalseVal;
 
-  if (Value *V =
-          simplifySelectWithAndOrXorBitOp(CmpLHS, CmpRHS, TrueVal, FalseVal))
-    return V;
+  // if (Value *V =
+  //         simplifySelectWithAndOrXorBitOp(CmpLHS, CmpRHS, TrueVal, FalseVal))
+  //   return V;
 
   return nullptr;
 }
@@ -4803,6 +4804,8 @@ static Value *simplifySelectWithFCmp(Value *Cond, Value *T, Value *F,
 /// If not, this returns null.
 static Value *simplifySelectInst(Value *Cond, Value *TrueVal, Value *FalseVal,
                                  const SimplifyQuery &Q, unsigned MaxRecurse) {
+
+LLVM_DEBUG(dbgs() << "SIM   :";Cond->dump();TrueVal->dump();FalseVal->dump(););
   if (auto *CondC = dyn_cast<Constant>(Cond)) {
     if (auto *TrueC = dyn_cast<Constant>(TrueVal))
       if (auto *FalseC = dyn_cast<Constant>(FalseVal))
@@ -4895,8 +4898,22 @@ static Value *simplifySelectInst(Value *Cond, Value *TrueVal, Value *FalseVal,
   }
 
   // select ?, X, X -> X
-  if (TrueVal == FalseVal)
+  if (TrueVal == FalseVal) {
+    LLVM_DEBUG(dbgs() << "T == F");
     return TrueVal;
+  }
+
+  // select ?, (X BinOp Y), (X BinOp Y) -> X BinOp Y
+  // bool isBinOp = isa<BinaryOperator>(TrueVal) && isa<BinaryOperator>(FalseVal);
+  // if (isBinOp) {
+  //   Value *X, *Y;
+  //   BinaryOperator *TBinOp = cast<BinaryOperator>(TrueVal);
+  //   BinaryOperator *FBinOp = cast<BinaryOperator>(FalseVal);
+  //   if (match(TrueVal, m_BinOp(m_Value(X), m_Value(Y))) &&
+  //       match(FalseVal, m_BinOp(m_Deferred(X), m_Deferred(Y))))
+  //       LLVM_DEBUG(dbgs() << " T == F ";);
+  //     return TrueVal;
+  // } 
 
   if (Cond == TrueVal) {
     // select i1 X, i1 X, i1 false --> X (logical-and)
