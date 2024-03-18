@@ -1430,6 +1430,8 @@ bool FPPassManager::runOnFunction(Function &F) {
     // still virtual and repeated calling adds unnecessary overhead.
     llvm::TimeTraceScope PassScope(
         "RunPass", [FP]() { return std::string(FP->getPassName()); });
+    
+    llvm::errs() << "PASS : " << std::string(FP->getPassName()) << " \n";
 
     dumpPassInfo(FP, EXECUTION_MSG, ON_FUNCTION_MSG, Name);
     dumpRequiredSet(FP);

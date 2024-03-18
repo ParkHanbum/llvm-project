@@ -187,6 +187,8 @@ struct AArch64LoadStoreOpt : public MachineFunctionPass {
   mergeUpdateInsn(MachineBasicBlock::iterator I,
                   MachineBasicBlock::iterator Update, bool IsPreIdx);
 
+  bool findRepeatingConstant(MachineInstr &I, unsigned Limit);
+
   // Find and merge zero store instructions.
   bool tryToMergeZeroStInst(MachineBasicBlock::iterator &MBBI);
 
@@ -2250,6 +2252,123 @@ MachineBasicBlock::iterator AArch64LoadStoreOpt::findMatchingUpdateInsnBackward(
   return E;
 }
 
+bool AArch64LoadStoreOpt::findRepeatingConstant(MachineInstr &MI,
+                                                unsigned Limit) {
+  MachineBasicBlock::iterator B = MI.getParent()->begin();
+  MachineBasicBlock::iterator E = MI.getParent()->end();
+  MachineBasicBlock::iterator MBBI = MI.getIterator();
+  const MachineFunction &MF = *MI.getMF();
+  int StoreSize = TII->getMemScale(MI);
+  // at least we need 4 byte for reducing repeating constant
+  if (MBBI == B || !((StoreSize / 4 >= 1) && (StoreSize % 4 == 0)))
+    return false;
+
+  Register BaseReg = MI.getOperand(0).getReg();
+  ModifiedRegUnits.clear();
+  UsedRegUnits.clear();
+  unsigned Count = 0, SuccIndex = 0;
+  uint64_t Accumulated = 0;
+  SmallVector<MachineInstr *, 4> MIs;
+
+  do {
+    MBBI = prev_nodbg(MBBI, B);
+    MachineInstr &MI = *MBBI;
+    if (!MI.isTransient())
+      ++Count;
+    unsigned CurrOpc = MI.getOpcode();
+    if (MI.getOperand(0).isReg() && BaseReg == MI.getOperand(0).getReg() &&
+        !(CurrOpc == AArch64::MOVZXi || CurrOpc == AArch64::MOVKXi)) {
+      LiveRegUnits::accumulateUsedDefed(MI, ModifiedRegUnits, UsedRegUnits,
+                                        TRI);
+      continue;
+    }
+#if !defined(NDEBUG)
+    unsigned Index = 0, OpCount = MI.getNumOperands();
+    for (; Index < OpCount; Index++)
+      LLVM_DEBUG(dbgs() << "MOV : [" << Index << "]";
+                 MI.getOperand(Index).dump());
+#endif
+    LLVM_DEBUG(dbgs() << "Analysing 2nd insn: "; MI.dump());
+    unsigned ValueOrder = CurrOpc == AArch64::MOVZXi ? 1 : 2;
+    MachineOperand Value = MI.getOperand(ValueOrder);
+    MachineOperand Shift = MI.getOperand(ValueOrder+1);
+    if (!Value.isImm() || !Shift.isImm())
+      return false;
+
+    uint64_t IValue = Value.getImm();
+    uint64_t IShift = Shift.getImm();
+    Accumulated += (IValue << IShift);
+    MIs.push_back(&MI);
+
+    LLVM_DEBUG(dbgs() << " match " << Accumulated);
+    LLVM_DEBUG(dbgs() << " match " << (Accumulated>>32) );
+    LLVM_DEBUG(dbgs() << " match " << (Accumulated & UINT_MAX));
+    // check fit for condition 
+    if ((Accumulated>>32) == (Accumulated&UINT_MAX)) {
+      SuccIndex = Count;
+      LLVM_DEBUG(dbgs() << " match " << Accumulated << " Succ : " << SuccIndex);
+    } 
+
+    LLVM_DEBUG(dbgs() << "imm : " << IValue << " lsl " << IShift << "acc " << Accumulated);
+
+    if (!ModifiedRegUnits.available(BaseReg) ||
+        !UsedRegUnits.available(BaseReg))
+      return false;
+  } while (MBBI != B && Count < Limit);
+
+  LLVM_DEBUG(dbgs() << "Acc : ======================= \n");
+  if (SuccIndex) {
+    int Index = 0;
+    MachineInstr *FirstMovI;
+    for (auto I = MIs.begin(), E = MIs.end(); I != E; ++I, Index++) {
+      if (Index == SuccIndex-1) {
+        FirstMovI = *I;
+        break;
+      }
+      LLVM_DEBUG(dbgs() << "MIs : ["<<SuccIndex<<"] :" << Index; (*I)->dump());
+      (*I)->eraseFromParent();
+    }
+
+    // build new instrs
+    // mov     w1, 49370
+    // movk    w1, 0x140, lsl 16
+    // stp     w1, w1, [x0]
+    MachineBasicBlock *MBB = MI.getParent();
+    LLVM_DEBUG(MBB->dump(););
+    LLVM_DEBUG(dbgs() << "MEMMI : "; MI.dump());
+    LLVM_DEBUG(dbgs() << "FIRSTMI : "; FirstMovI->dump());
+    Register DstRegW = TRI->getSubReg(FirstMovI->getOperand(0).getReg(), AArch64::sub_32);
+    BuildMI(*MBB, FirstMovI, FirstMovI->getDebugLoc(), TII->get(AArch64::MOVZWi),
+            DstRegW)
+        .addImm(Accumulated & 0xFFFF)
+        .addImm(0);
+    BuildMI(*MBB, FirstMovI, FirstMovI->getDebugLoc(), TII->get(AArch64::MOVKWi),
+            DstRegW)
+        .addUse(DstRegW)
+        .addImm((Accumulated >> 16) & 0xFFFF)
+        .addImm(16);
+    FirstMovI->eraseFromParent();
+
+    MachineInstrBuilder MIB;
+    bool isKill = MI.getOperand(0).isKill();
+    DstRegW = TRI->getSubReg(BaseReg, AArch64::sub_32);
+    MIB = BuildMI(*MBB, MI, MI.getDebugLoc(), TII->get(AArch64::STPXi))
+              .addReg(DstRegW, RegState::Renamable|RegState::Kill, 0)
+              .addReg(DstRegW, RegState::Renamable|RegState::Kill, 0)
+              .addReg(MI.getOperand(1).getReg(), RegState::Renamable|RegState::Kill)
+              .addImm(0)
+              .setMemRefs(MI.memoperands())
+              .setMIFlags(MI.getFlags());
+    (void)MIB;
+    MI.eraseFromParent();
+    LLVM_DEBUG(MBB->dump());
+    return true;
+  }
+
+  LLVM_DEBUG(dbgs() << "Acc : " << Accumulated << " Succ : " << SuccIndex);
+  return false;
+}
+
 bool AArch64LoadStoreOpt::tryToPromoteLoadFromStore(
     MachineBasicBlock::iterator &MBBI) {
   MachineInstr &MI = *MBBI;
@@ -2437,6 +2556,7 @@ bool AArch64LoadStoreOpt::tryToMergeLdStUpdate
 bool AArch64LoadStoreOpt::optimizeBlock(MachineBasicBlock &MBB,
                                         bool EnableNarrowZeroStOpt) {
 
+  LLVM_DEBUG(dbgs() << "ENTRY==============\n");
   bool Modified = false;
   // Four tranformations to do here:
   // 1) Find loads that directly read from stores and promote them by
@@ -2510,6 +2630,25 @@ bool AArch64LoadStoreOpt::optimizeBlock(MachineBasicBlock &MBB,
       Modified = true;
     else
       ++MBBI;
+  }
+
+  // We have an opportunity to optimize the `STRXui` instruction, which loads
+  // the same 32-bit value into a register twice. The `STPXi` instruction allows 
+  // us to load a 32-bit value only once. 
+  // Considering :
+  // mov     x8, 49370
+  // movk    x8, 320, lsl #16
+  // movk    x8, 49370, lsl #32
+  // movk    x8, 320, lsl #48
+  // str     x8, [x0]
+  // Transform :
+  // mov     w8, 49370
+  // movk    w8, 320, lsl #16
+  // stp     w8, w8, [x0]
+  for (MachineInstr &MI : make_early_inc_range(MBB)) {
+    if (MI.getOpcode() == AArch64::STRXui)
+      Modified |= findRepeatingConstant(MI, UpdateLimit);
+    LLVM_DEBUG(dbgs() << "END";);
   }
 
   return Modified;
