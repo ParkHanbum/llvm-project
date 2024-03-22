@@ -226,6 +226,17 @@ struct AArch64LoadStoreOpt : public MachineFunctionPass {
   // Find and merge an index ldr/st instruction into a base ld/st instruction.
   bool tryToMergeIndexLdSt(MachineBasicBlock::iterator &MBBI, int Scale);
 
+  // Finds and collapses loads of symmetric constant value.
+  bool isStrCanBeReplaced(MachineBasicBlock::iterator I, unsigned Limit);
+
+  // Finds and collapses loads of symmetric constant value.
+  bool tryFoldSymmetryConstantLoad(MachineBasicBlock::iterator &I,
+                                   unsigned Limit);
+  MachineBasicBlock::iterator
+  doFoldSymmetryConstantLoad(MachineInstr &MI,
+                             SmallVectorImpl<MachineBasicBlock::iterator> &MIs,
+                             int UpperLoadIdx, int Accumulated);
+
   bool optimizeBlock(MachineBasicBlock &MBB, bool EnableNarrowZeroStOpt);
 
   bool runOnMachineFunction(MachineFunction &Fn) override;
@@ -2443,6 +2454,155 @@ AArch64LoadStoreOpt::findMatchingConstOffsetBackward(
   return E;
 }
 
+static bool isSymmetricLoadCandidate(MachineInstr &MI, Register BaseReg) {
+  auto MatchBaseReg = [&](unsigned Count) {
+    for (unsigned I = 0; I < Count; I++) {
+      auto OpI = MI.getOperand(I);
+      if (OpI.isReg() && OpI.getReg() != BaseReg)
+        return false;
+    }
+    return true;
+  };
+
+  unsigned Opc = MI.getOpcode();
+  switch (Opc) {
+  default:
+    return false;
+  case AArch64::MOVZXi:
+    return MatchBaseReg(1);
+  case AArch64::MOVKXi:
+    return MatchBaseReg(2);
+  case AArch64::ORRXrs:
+    MachineOperand &Imm = MI.getOperand(3);
+    // Fourth operand of ORR must be 32 which mean
+    // 32bit symmetric constant load.
+    // ex) renamable $x8 = ORRXrs $x8, $x8, 32
+    if (MatchBaseReg(3) && Imm.isImm() && Imm.getImm() == 32)
+      return true;
+  }
+
+  return false;
+}
+
+MachineBasicBlock::iterator AArch64LoadStoreOpt::doFoldSymmetryConstantLoad(
+    MachineInstr &MI, SmallVectorImpl<MachineBasicBlock::iterator> &MIs,
+    int UpperLoadIdx, int Accumulated) {
+  MachineBasicBlock::iterator I = MI.getIterator();
+  MachineBasicBlock::iterator E = I->getParent()->end();
+  MachineBasicBlock::iterator NextI = next_nodbg(I, E);
+  MachineBasicBlock *MBB = MI.getParent();
+
+  if (!UpperLoadIdx) {
+    // ORR ensures that previous instructions load lower 32-bit constants.
+    // Remove ORR only.
+    (*MIs.begin())->eraseFromParent();
+  } else {
+    // We need to remove MOV for upper of 32bit because we know these instrs
+    // is part of symmetric constant.
+    int Index = 0;
+    for (auto MI = MIs.begin(); Index < UpperLoadIdx; ++MI, Index++) {
+      (*MI)->eraseFromParent();
+    }
+  }
+
+  Register BaseReg = getLdStRegOp(MI).getReg();
+  const MachineOperand MO = AArch64InstrInfo::getLdStBaseOp(MI);
+  Register DstRegW = TRI->getSubReg(BaseReg, AArch64::sub_32);
+  unsigned DstRegState = getRegState(MI.getOperand(0));
+  int Offset = AArch64InstrInfo::getLdStOffsetOp(MI).getImm();
+  BuildMI(*MBB, MI, MI.getDebugLoc(), TII->get(AArch64::STPWi))
+      .addReg(DstRegW, DstRegState)
+      .addReg(DstRegW, DstRegState)
+      .addReg(MO.getReg(), getRegState(MO))
+      .addImm(Offset * 2)
+      .setMemRefs(MI.memoperands())
+      .setMIFlags(MI.getFlags());
+  I->eraseFromParent();
+  return NextI;
+}
+
+bool AArch64LoadStoreOpt::tryFoldSymmetryConstantLoad(
+    MachineBasicBlock::iterator &I, unsigned Limit) {
+  MachineInstr &MI = *I;
+  if (MI.getOpcode() != AArch64::STRXui)
+    return false;
+
+  MachineBasicBlock::iterator MBBI = I;
+  MachineBasicBlock::iterator B = I->getParent()->begin();
+  if (MBBI == B)
+    return false;
+
+  TypeSize Scale(0U, false), Width(0U, false);
+  int64_t MinOffset, MaxOffset;
+  if (!AArch64InstrInfo::getMemOpInfo(AArch64::STPWi, Scale, Width, MinOffset,
+                                      MaxOffset))
+    return false;
+
+  // We replace the STRX instruction, which stores 64 bits, with the STPW
+  // instruction, which stores two consecutive 32 bits. Therefore, we compare
+  // the offset range with multiplied by two.
+  int Offset = AArch64InstrInfo::getLdStOffsetOp(MI).getImm();
+  if (Offset * 2 < MinOffset || Offset * 2 > MaxOffset)
+    return false;
+
+  Register BaseReg = getLdStRegOp(MI).getReg();
+  unsigned Count = 0, UpperLoadIdx = 0;
+  uint64_t Accumulated = 0, Mask = 0xFFFFUL;
+  bool hasORR = false, Found = false;
+  SmallVector<MachineBasicBlock::iterator> MIs;
+  ModifiedRegUnits.clear();
+  UsedRegUnits.clear();
+  do {
+    MBBI = prev_nodbg(MBBI, B);
+    MachineInstr &MI = *MBBI;
+    if (!MI.isTransient())
+      ++Count;
+    if (!isSymmetricLoadCandidate(MI, BaseReg)) {
+      LiveRegUnits::accumulateUsedDefed(MI, ModifiedRegUnits, UsedRegUnits,
+                                        TRI);
+      if (!ModifiedRegUnits.available(BaseReg) ||
+          !UsedRegUnits.available(BaseReg))
+        return false;
+      continue;
+    }
+
+    unsigned Opc = MI.getOpcode();
+    if (Opc == AArch64::ORRXrs) {
+      hasORR = true;
+      MIs.push_back(MBBI);
+      continue;
+    }
+    unsigned ValueOrder = Opc == AArch64::MOVZXi ? 1 : 2;
+    MachineOperand Value = MI.getOperand(ValueOrder);
+    MachineOperand Shift = MI.getOperand(ValueOrder + 1);
+    if (!Value.isImm() || !Shift.isImm())
+      return false;
+
+    uint64_t IValue = Value.getImm();
+    uint64_t IShift = Shift.getImm();
+    uint64_t Adder = IValue << IShift;
+    MIs.push_back(MBBI);
+    if (Adder >> 32)
+      UpperLoadIdx = MIs.size();
+
+    Accumulated -= Accumulated & (Mask << IShift);
+    Accumulated += Adder;
+    if (Accumulated != 0 &&
+        (((Accumulated >> 32) == (Accumulated & 0xffffffffULL)) ||
+         (hasORR && (Accumulated >> 32 == 0)))) {
+      Found = true;
+      break;
+    }
+  } while (MBBI != B && Count < Limit);
+
+  if (Found) {
+    I = doFoldSymmetryConstantLoad(MI, MIs, UpperLoadIdx, Accumulated);
+    return true;
+  }
+
+  return false;
+}
+
 bool AArch64LoadStoreOpt::tryToPromoteLoadFromStore(
     MachineBasicBlock::iterator &MBBI) {
   MachineInstr &MI = *MBBI;
@@ -2659,6 +2819,48 @@ bool AArch64LoadStoreOpt::tryToMergeIndexLdSt(MachineBasicBlock::iterator &MBBI,
   return false;
 }
 
+bool AArch64LoadStoreOpt::isStrCanBeReplaced(MachineBasicBlock::iterator I,
+                                             unsigned Limit) {
+  MachineBasicBlock::iterator B = I->getParent()->begin();
+  MachineBasicBlock::iterator E = I->getParent()->end();
+  MachineInstr &MemMI = *I;
+  MachineBasicBlock::iterator MBBI = I;
+
+  // If the load is the first instruction in the block, there's obviously
+  // not any matching load or store.
+  if (MBBI == B || !I->mayStore())
+    return false;
+
+  Register BaseReg = getLdStRegOp(MemMI).getReg();
+  // Track which register units have been modified and used between the first
+  // insn (inclusive) and the second insn.
+  ModifiedRegUnits.clear();
+  UsedRegUnits.clear();
+  MBBI = next_nodbg(MBBI, E);
+
+  for (unsigned Count = 0; MBBI != E && Count < Limit;
+       MBBI = next_nodbg(MBBI, E)) {
+    MachineInstr &MI = *MBBI;
+    // Don't count transient instructions towards the search limit since there
+    // may be different numbers of them if e.g. debug information is present.
+    if (!MI.isTransient())
+      ++Count;
+    // Update the status of what the instruction clobbered and used.
+    LiveRegUnits::accumulateUsedDefed(MI, ModifiedRegUnits, UsedRegUnits, TRI);
+
+    if (!ModifiedRegUnits.available(BaseReg))
+      return true;
+
+    if (!UsedRegUnits.available(BaseReg))
+      return false;
+
+    if (std::next(MBBI) == E && MI.getOpcode() == AArch64::RET)
+      return true;
+  }
+
+  return false;
+}
+
 bool AArch64LoadStoreOpt::optimizeBlock(MachineBasicBlock &MBB,
                                         bool EnableNarrowZeroStOpt) {
 
@@ -2748,6 +2950,25 @@ bool AArch64LoadStoreOpt::optimizeBlock(MachineBasicBlock &MBB,
        MBBI != E;) {
     int Scale;
     if (isMergeableIndexLdSt(*MBBI, Scale) && tryToMergeIndexLdSt(MBBI, Scale))
+          Modified = true;
+    else
+      ++MBBI;
+  }
+
+  // 6) Find the sequence that loads the symmetric 64-bit value that can
+  // be combined into `STP`. e.g.,
+  //        mov	 x9, #22136
+  //        movk x9, #4660, lsl #16
+  //        orr	 x9, x9, x9, lsl #32
+  //        str	 x9, [x8]
+  //        ; becomes
+  //        mov	 x8, #22136
+  //        movk x8, #4660, lsl #16
+  //        stp	w8, w8, [x0]
+  for (MachineBasicBlock::iterator MBBI = MBB.begin(), E = MBB.end();
+       MBBI != E;) {
+    if (isMergeableLdStUpdate(*MBBI) && isStrCanBeReplaced(MBBI, UpdateLimit) &&
+        tryFoldSymmetryConstantLoad(MBBI, UpdateLimit))
       Modified = true;
     else
       ++MBBI;
