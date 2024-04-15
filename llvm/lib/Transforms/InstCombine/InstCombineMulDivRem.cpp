@@ -1434,6 +1434,84 @@ static Instruction *narrowUDivURem(BinaryOperator &I,
   return nullptr;
 }
 
+static Instruction *ttt(Instruction *Mul, Value *Divider, bool IsSigned, InstCombinerImpl &IC) {
+ Value *Op0 = Mul->getOperand(0), *Op1 = Mul->getOperand(1);
+  LLVM_DEBUG(dbgs() << "=================2===================\n");
+  Mul->dump(); Divider->dump(); Op0->dump(); Op1->dump();
+  LLVM_DEBUG(dbgs() << "====================================\n");
+ 
+  Value *X, *Y;
+  // (X * Y) / X --> Y (and commuted variants)
+  if (match(Op0, m_Mul(m_Value(X), m_Value(Y)))) {
+    auto HasNSW = cast<OverflowingBinaryOperator>(Mul)->hasNoSignedWrap();
+    auto HasNUW = cast<OverflowingBinaryOperator>(Mul)->hasNoUnsignedWrap();
+
+    auto CreateDivOrNull = [&](Value *A, Value *B) -> Value * {
+      const APInt *C1, *C2;
+      if (IsSigned && HasNSW) {
+        if (match(B, m_APInt(C1)) && !C1->isAllOnes())
+          return IC.Builder.CreateSDiv(A, B);
+      }
+      if (!IsSigned && HasNUW) {
+        if (match(A, m_APInt(C1)) && match(B, m_APInt(C2)) && C2->ule(*C1))
+          return IC.Builder.CreateUDiv(A, B);
+      }
+      return nullptr;
+    };
+
+    if (Op0 == Divider) {
+      LLVM_DEBUG(dbgs() << "C1\n");
+      if (auto *Val = CreateDivOrNull(Op0, Divider)) {
+        return IC.replaceOperand(*Mul, 0, Val);
+      }
+    }
+    if (Op1 == Divider) {
+      LLVM_DEBUG(dbgs() << "C2\n");
+      if (auto *Val = CreateDivOrNull(Op1, Divider)) {
+        return IC.replaceOperand(*Mul, 1, Val);
+      }
+    }
+  }
+
+  return nullptr;
+}
+
+static Instruction *tttt(Instruction *Mul, Value *Divider, bool IsSigned, InstCombinerImpl &IC) {
+  LLVM_DEBUG(dbgs() << "====================================\n");
+  Mul->dump(); Divider->dump();
+  LLVM_DEBUG(dbgs() << "====================================\n");
+  if (auto I = ttt(Mul, Divider, IsSigned, IC))
+    return I;
+
+  Value *Op0 = Mul->getOperand(0), *Op1 = Mul->getOperand(1);
+  BinaryOperator *Bop;
+
+  if ((Bop = dyn_cast<BinaryOperator>(Op0)) != nullptr &&
+      Bop->getOpcode() == Instruction::BinaryOps::Mul) {
+    return tttt(Bop, Divider, IsSigned, IC);
+  }
+  if ((Bop = dyn_cast<BinaryOperator>(Op1)) != nullptr &&
+      Bop->getOpcode() == Instruction::BinaryOps::Mul) {
+    return tttt(Bop, Divider, IsSigned, IC);
+  }
+
+  return nullptr;
+}
+
+static Instruction *BackwardSearchForDivisonValue(BinaryOperator &I,
+                                                  InstCombinerImpl &IC) {
+  Value *Op0 = I.getOperand(0), *Divider = I.getOperand(1);
+  bool IsSigned = I.getOpcode() == Instruction::SDiv;
+  BinaryOperator *Bop = nullptr;
+  if ((Bop = dyn_cast<BinaryOperator>(Op0)) != nullptr &&
+      Bop->getOpcode() == Instruction::BinaryOps::Mul) {
+    if (auto I = tttt(cast<Instruction>(Bop), Divider, IsSigned, IC))
+      return I;
+  }
+
+  return nullptr;
+}
+
 Instruction *InstCombinerImpl::visitUDiv(BinaryOperator &I) {
   if (Value *V = simplifyUDivInst(I.getOperand(0), I.getOperand(1), I.isExact(),
                                   SQ.getWithInstruction(&I)))
@@ -1640,6 +1718,19 @@ Instruction *InstCombinerImpl::visitSDiv(BinaryOperator &I) {
     return SelectInst::Create(Cond, ConstantInt::get(Ty, 1),
                               ConstantInt::getAllOnesValue(Ty));
   }
+
+  // considering A * B * C * D * E / A
+  // We have an optimization opportunity to apply div A for A mul B.
+  // To do this, we need to search backwards to find if there is a value that
+  // matches the current div value.
+  if (Value *V = BackwardSearchForDivisonValue(I, *this)) {
+    LLVM_DEBUG(dbgs() << "RESULT : ";V->dump());
+    // return replaceOperand(I, 1, V);
+    replaceInstUsesWith(I, I.getOperand(0));
+    return eraseInstFromFunction(I);
+  }
+
+
   return nullptr;
 }
 
