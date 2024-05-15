@@ -1068,16 +1068,15 @@ static bool canSplitIdx(LoadSDNode *LD) {
           !cast<ConstantSDNode>(LD->getOperand(2))->isOpaque());
 }
 
-static bool isAddressingModePatternSHL(unsigned Opc, const SDLoc &DL, SDNode *N,
-                                       SDValue Op0, SDValue Op1,
-                                       const TargetLowering &TLI,
-                                       const SelectionDAG &DAG) {
+bool DAGCombiner::isAddressingModePattern(unsigned Opc, const SDLoc &DL,
+                                          SDNode *N, SDValue Op0, SDValue Op1) {
   // handle (shl (srl x, c1) 2)
   if (!N->hasOneUse())
     return false;
 
   APInt SrlAmt;
-  if (sd_match(N, m_Shl(m_Srl(m_Value(), m_ConstInt(SrlAmt)), m_SpecificInt(2)))) {
+  if (sd_match(N,
+               m_Shl(m_Srl(m_Value(), m_ConstInt(SrlAmt)), m_SpecificInt(2)))) {
     // Srl knownbits
     SDValue ShlV = SDValue(N, 0);
     unsigned RegSize = ShlV.getValueType().getScalarSizeInBits();
@@ -1090,7 +1089,7 @@ static bool isAddressingModePatternSHL(unsigned Opc, const SDLoc &DL, SDNode *N,
 
     if (Known.getBitWidth() != RegSize)
       return false;
-    
+
     // check load (ldr x, (add x, (shl (srl x, c1) 2)))
     SDNode *User = N->use_begin().getUse().getUser();
     LLVM_DEBUG(dbgs() << "N : "; N->dump(); User->dump());
@@ -1098,7 +1097,7 @@ static bool isAddressingModePatternSHL(unsigned Opc, const SDLoc &DL, SDNode *N,
       return false;
 
     SDNode *Load = User->use_begin().getUse().getUser();
-    LLVM_DEBUG(dbgs() << "LOAD : "; Load->dump(); );
+    LLVM_DEBUG(dbgs() << "LOAD : "; Load->dump(););
     if (!Load || Load->getOpcode() != ISD::LOAD)
       return false;
 
@@ -1116,40 +1115,15 @@ static bool isAddressingModePatternSHL(unsigned Opc, const SDLoc &DL, SDNode *N,
     if (!TLI.isLegalAddressingMode(DAG.getDataLayout(), AM, AccessTy, AS))
       return false;
 
+    SDValue BasePtr;
+    SDValue Offset;
+    ISD::MemIndexedMode MIM = ISD::UNINDEXED; 
+    if (!TLI.getPreIndexedAddressParts(Load, BasePtr, Offset, MIM, DAG)) {
+      LLVM_DEBUG(dbgs() << "Combine : ";);
+    }
 
-    LLVM_DEBUG(dbgs() << "Success : \n"; );
+    LLVM_DEBUG(dbgs() << "Success : \n";);
     return true;
-  }
-
-
-  // const APInt &C2APIntVal = Op1C->getAPIntValue();
-  // for (SDNode *Node : N->uses()) {
-  //   if (auto *LoadStore = dyn_cast<MemSDNode>(Node)) {
-  //     TargetLoweringBase::AddrMode AM;
-  //     AM.HasBaseReg = true;
-  //     AM.BaseOffs = C2APIntVal.getSExtValue();
-  //     EVT VT = LoadStore->getMemoryVT();
-  //     unsigned AS = LoadStore->getAddressSpace();
-  //     Type *AccessTy = VT.getTypeForEVT(*DAG.getContext());
-  //     if (!TLI.isLegalAddressingMode(DAG.getDataLayout(), AM, AccessTy, AS))
-  //       continue;
-
-  //     // Would x[offset1+offset2] still be a legal addressing mode?
-  //     if (!TLI.isLegalAddressingMode(DAG.getDataLayout(), AM, AccessTy, AS))
-  //       return true;
-  //   }
-  // }
-
-  return false;
-}
-
-bool DAGCombiner::isAddressingModePattern(unsigned Opc, const SDLoc &DL,
-                                          SDNode *N, SDValue Op0, SDValue Op1) {
-  switch (Opc) {
-    default:
-      false;
-    case ISD::SHL:
-      return isAddressingModePatternSHL(Opc, DL, N, Op0, Op1, TLI, DAG);
   }
 
   return false;

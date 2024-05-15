@@ -24968,6 +24968,7 @@ bool AArch64TargetLowering::getIndexedAddressParts(SDNode *N, SDNode *Op,
     return V.isUndef() || isNullOrNullSplat(V, /*AllowUndefs*/ true);
   };
 
+  LLVM_DEBUG(dbgs() << "AARC64 LOWERING \n");
   // If the only user of the value is a scalable vector splat, it is
   // preferable to do a replicating load (ld1r*).
   if (ValOnlyUser && ValOnlyUser->getValueType(0).isScalableVector() &&
@@ -24979,6 +24980,7 @@ bool AArch64TargetLowering::getIndexedAddressParts(SDNode *N, SDNode *Op,
   Base = Op->getOperand(0);
   // All of the indexed addressing mode instructions take a signed
   // 9 bit immediate offset.
+  LLVM_DEBUG(dbgs() << "AARC64 LOWERING \n");
   if (ConstantSDNode *RHS = dyn_cast<ConstantSDNode>(Op->getOperand(1))) {
     int64_t RHSC = RHS->getSExtValue();
     if (Op->getOpcode() == ISD::SUB)
