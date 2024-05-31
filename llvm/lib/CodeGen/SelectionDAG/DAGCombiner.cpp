@@ -1068,66 +1068,6 @@ static bool canSplitIdx(LoadSDNode *LD) {
           !cast<ConstantSDNode>(LD->getOperand(2))->isOpaque());
 }
 
-bool DAGCombiner::isAddressingModePattern(unsigned Opc, const SDLoc &DL,
-                                          SDNode *N, SDValue Op0, SDValue Op1) {
-  // handle (shl (srl x, c1) 2)
-  if (!N->hasOneUse())
-    return false;
-
-  APInt SrlAmt;
-  if (sd_match(N,
-               m_Shl(m_Srl(m_Value(), m_ConstInt(SrlAmt)), m_SpecificInt(2)))) {
-    // Srl knownbits
-    SDValue ShlV = SDValue(N, 0);
-    unsigned RegSize = ShlV.getValueType().getScalarSizeInBits();
-    KnownBits Known = DAG.computeKnownBits(ShlV);
-
-    LLVM_DEBUG(dbgs() << "RegSize" << RegSize
-                      << "knownbit : " << Known.getBitWidth()
-                      << "AMT : " << SrlAmt << " knownbits : " << Known
-                      << "MAX : " << Known.getMaxValue() << "\n");
-
-    if (Known.getBitWidth() != RegSize)
-      return false;
-
-    // check load (ldr x, (add x, (shl (srl x, c1) 2)))
-    SDNode *User = N->use_begin().getUse().getUser();
-    LLVM_DEBUG(dbgs() << "N : "; N->dump(); User->dump());
-    if (!User || User->getOpcode() != ISD::ADD)
-      return false;
-
-    SDNode *Load = User->use_begin().getUse().getUser();
-    LLVM_DEBUG(dbgs() << "LOAD : "; Load->dump(););
-    if (!Load || Load->getOpcode() != ISD::LOAD)
-      return false;
-
-    auto LoadM = dyn_cast<MemSDNode>(Load);
-    if (!LoadM)
-      return false;
-
-    TargetLoweringBase::AddrMode AM;
-    AM.HasBaseReg = true;
-    AM.BaseOffs = Known.getMaxValue().getZExtValue();
-    LLVM_DEBUG(dbgs() << "BaseMax : " << AM.BaseOffs << "\n");
-    EVT VT = LoadM->getMemoryVT();
-    unsigned AS = LoadM->getAddressSpace();
-    Type *AccessTy = VT.getTypeForEVT(*DAG.getContext());
-    if (!TLI.isLegalAddressingMode(DAG.getDataLayout(), AM, AccessTy, AS))
-      return false;
-
-    SDValue BasePtr;
-    SDValue Offset;
-    ISD::MemIndexedMode MIM = ISD::UNINDEXED; 
-    if (!TLI.getPreIndexedAddressParts(Load, BasePtr, Offset, MIM, DAG)) {
-      LLVM_DEBUG(dbgs() << "Combine : ";);
-    }
-
-    LLVM_DEBUG(dbgs() << "Success : \n";);
-    return true;
-  }
-
-  return false;
-}
 
 bool DAGCombiner::reassociationCanBreakAddressingModePattern(unsigned Opc,
                                                              const SDLoc &DL,
@@ -18166,8 +18106,10 @@ static bool getCombineLoadStoreParts(SDNode *N, unsigned Inc, unsigned Dec,
                                      bool &IsLoad, bool &IsMasked, SDValue &Ptr,
                                      const TargetLowering &TLI) {
   if (LoadSDNode *LD = dyn_cast<LoadSDNode>(N)) {
-    if (LD->isIndexed())
-      return false;
+    // if (LD->isIndexed())
+    //   return false;
+
+    LLVM_DEBUG(dbgs() << "Combine1 : ";);
     EVT VT = LD->getMemoryVT();
     if (!TLI.isIndexedLoadLegal(Inc, VT) && !TLI.isIndexedLoadLegal(Dec, VT))
       return false;
@@ -18181,6 +18123,8 @@ static bool getCombineLoadStoreParts(SDNode *N, unsigned Inc, unsigned Dec,
     Ptr = ST->getBasePtr();
     IsLoad = false;
   } else if (MaskedLoadSDNode *LD = dyn_cast<MaskedLoadSDNode>(N)) {
+
+      LLVM_DEBUG(dbgs() << "Combine 2: ";);
     if (LD->isIndexed())
       return false;
     EVT VT = LD->getMemoryVT();
@@ -28405,6 +28349,63 @@ bool DAGCombiner::findBetterNeighborChains(StoreSDNode *St) {
     replaceStoreChain(St, BetterChain);
     return true;
   }
+  return false;
+}
+
+bool DAGCombiner::isAddressingModePattern(unsigned Opc, const SDLoc &DL,
+                                          SDNode *N, SDValue Op0, SDValue Op1) {
+  // handle (shl (srl x, c1) 2)
+  if (!N->hasOneUse())
+    return false;
+
+  APInt SrlAmt;
+  if (sd_match(N,
+               m_Shl(m_Srl(m_Value(), m_ConstInt(SrlAmt)), m_SpecificInt(2)))) {
+    // Srl knownbits
+    SDValue ShlV = SDValue(N, 0);
+    unsigned RegSize = ShlV.getValueType().getScalarSizeInBits();
+    KnownBits Known = DAG.computeKnownBits(ShlV);
+
+    LLVM_DEBUG(dbgs() << "RegSize" << RegSize
+                      << "knownbit : " << Known.getBitWidth()
+                      << "AMT : " << SrlAmt << " knownbits : " << Known
+                      << "MAX : " << Known.getMaxValue() << "\n");
+
+    if (Known.getBitWidth() != RegSize)
+      return false;
+
+    // check load (ldr x, (add x, (shl (srl x, c1) 2)))
+    SDNode *User = N->use_begin().getUse().getUser();
+    LLVM_DEBUG(dbgs() << "N : "; N->dump(); User->dump());
+    if (!User || User->getOpcode() != ISD::ADD)
+      return false;
+
+    SDNode *Load = User->use_begin().getUse().getUser();
+    LLVM_DEBUG(dbgs() << "LOAD : "; Load->dump(););
+    if (!Load || Load->getOpcode() != ISD::LOAD)
+      return false;
+
+    auto LoadN = dyn_cast<LoadSDNode>(Load);
+    if (!LoadN)
+      return false;
+
+    TargetLoweringBase::AddrMode AM;
+    AM.HasBaseReg = true;
+    AM.BaseOffs = Known.getMaxValue().getZExtValue();
+    LLVM_DEBUG(dbgs() << "BaseMax : " << AM.BaseOffs << "\n");
+    EVT VT = LoadN->getMemoryVT();
+    unsigned AS = LoadN->getAddressSpace();
+    Type *AccessTy = VT.getTypeForEVT(*DAG.getContext());
+    if (!TLI.isLegalAddressingMode(DAG.getDataLayout(), AM, AccessTy, AS))
+      return false;
+
+    if (!TLI.isIndexedLoadLegal(ISD::PRE_INC, VT) &&
+        !TLI.isIndexedLoadLegal(ISD::PRE_DEC, VT))
+      return false;
+    LLVM_DEBUG(dbgs() << "Success : \n";);
+    return true;
+  }
+
   return false;
 }
 
