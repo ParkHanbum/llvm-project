@@ -383,3 +383,47 @@ entry:
   %add = add i8 %trunc, %lsl.trunc
   ret i8 %add
 }
+
+define i32 @load_shr64(i64 %a, i64 %b, ptr %table) {
+entry:
+  %mul = mul i64 %b, %a
+  %shr = lshr i64 %mul, 64
+  %arrayidx = getelementptr inbounds i32, ptr %table, i64 %shr
+  %0 = load i32, ptr %arrayidx, align 4
+  ret i32 %0
+}
+
+define i32 @load_shr58(i64 %a, i64 %b, ptr %table) {
+entry:
+  %mul = mul i64 %b, %a
+  %shr = lshr i64 %mul, 58
+  %arrayidx = getelementptr inbounds i32, ptr %table, i64 %shr
+  %0 = load i32, ptr %arrayidx, align 4
+  ret i32 %0
+}
+
+define i32 @load_shr2(i64 %a, i64 %b, ptr %table) {
+entry:
+  %mul = mul i64 %b, %a
+  %shr = lshr i64 %mul, 2
+  %arrayidx = getelementptr inbounds i32, ptr %table, i64 %shr
+  %0 = load i32, ptr %arrayidx, align 4
+  ret i32 %0
+}
+
+define i32 @load_shr(i64 %a, i64 %b, ptr %table) {
+entry:
+  %mul = mul i64 %b, %a
+  %shr = lshr i64 %mul, 1
+  %arrayidx = getelementptr inbounds i32, ptr %table, i64 %shr
+  %0 = load i32, ptr %arrayidx, align 4
+  ret i32 %0
+}
+
+define i32 @test(i64 %a, i64 %b, ptr %table) {
+entry:
+  %shl = shl i64 %a, 1
+  %arrayidx = getelementptr inbounds i32, ptr %table, i64 %shl
+  %0 = load i32, ptr %arrayidx, align 4
+  ret i32 %0
+}
