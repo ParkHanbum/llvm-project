@@ -97,8 +97,8 @@ define i64 @testuu0xf555f555f555f555() {
 define void @test_store_0x1234567812345678(ptr %x) {
 ; CHECK-LABEL: test_store_0x1234567812345678:
 ; CHECK:       // %bb.0:
-; CHECK-NEXT:    mov w8, #22136 // =0x5678
-; CHECK-NEXT:    movk w8, #4660, lsl #16
+; CHECK-NEXT:    mov x8, #22136 // =0x5678
+; CHECK-NEXT:    movk x8, #4660, lsl #16
 ; CHECK-NEXT:    stp w8, w8, [x0]
 ; CHECK-NEXT:    ret
   store i64 u0x1234567812345678, ptr %x
@@ -108,8 +108,8 @@ define void @test_store_0x1234567812345678(ptr %x) {
 define void @test_store_0xff3456ffff3456ff(ptr %x) {
 ; CHECK-LABEL: test_store_0xff3456ffff3456ff:
 ; CHECK:       // %bb.0:
-; CHECK-NEXT:    mov w8, #22271 // =0x56ff
-; CHECK-NEXT:    movk w8, #65332, lsl #16
+; CHECK-NEXT:    mov x8, #22271 // =0x56ff
+; CHECK-NEXT:    movk x8, #65332, lsl #16
 ; CHECK-NEXT:    stp w8, w8, [x0]
 ; CHECK-NEXT:    ret
   store i64 u0xff3456ffff3456ff, ptr %x
@@ -153,8 +153,7 @@ define void @test_store_0x0000555555555555(ptr %x) {
 ; CHECK-LABEL: test_store_0x0000555555555555:
 ; CHECK:       // %bb.0:
 ; CHECK-NEXT:    mov x8, #6148914691236517205 // =0x5555555555555555
-; CHECK-NEXT:    movk x8, #0, lsl #48
-; CHECK-NEXT:    str x8, [x0]
+; CHECK-NEXT:    stp w8, w8, [x0]
 ; CHECK-NEXT:    ret
   store i64 u0x0000555555555555, ptr %x
   ret void
@@ -163,7 +162,7 @@ define void @test_store_0x0000555555555555(ptr %x) {
 define void @test_store_0x0000555500005555(ptr %x) {
 ; CHECK-LABEL: test_store_0x0000555500005555:
 ; CHECK:       // %bb.0:
-; CHECK-NEXT:    mov w8, #21845 // =0x5555
+; CHECK-NEXT:    mov x8, #21845 // =0x5555
 ; CHECK-NEXT:    stp w8, w8, [x0]
 ; CHECK-NEXT:    ret
   store i64 u0x0000555500005555, ptr %x
@@ -173,7 +172,7 @@ define void @test_store_0x0000555500005555(ptr %x) {
 define void @test_store_0x5555000055550000(ptr %x) {
 ; CHECK-LABEL: test_store_0x5555000055550000:
 ; CHECK:       // %bb.0:
-; CHECK-NEXT:    mov w8, #1431633920 // =0x55550000
+; CHECK-NEXT:    mov x8, #1431633920 // =0x55550000
 ; CHECK-NEXT:    stp w8, w8, [x0]
 ; CHECK-NEXT:    ret
   store i64 u0x5555000055550000, ptr %x
