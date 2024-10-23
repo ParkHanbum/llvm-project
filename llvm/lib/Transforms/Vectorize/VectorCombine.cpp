@@ -174,7 +174,8 @@ bool VectorCombine::vectorizeLoadInsert(Instruction &I) {
   // Match insert into fixed vector of scalar value.
   // TODO: Handle non-zero insert index.
   Value *Scalar;
-  if (!match(&I, m_InsertElt(m_Undef(), m_Value(Scalar), m_ZeroInt())) ||
+  const APInt *InsertOrd;
+  if (!match(&I, m_InsertElt(m_Undef(), m_Value(Scalar), m_APInt(InsertOrd))) ||
       !Scalar->hasOneUse())
     return false;
 
@@ -220,7 +221,8 @@ bool VectorCombine::vectorizeLoadInsert(Instruction &I) {
 
     // The offset must be a multiple of the scalar element to shuffle cleanly
     // in the element's size.
-    uint64_t ScalarSizeInBytes = ScalarSize / 8;
+    LLVM_DEBUG(dbgs() << "InsertOrd : " << InsertOrd->getSExtValue()  << " ScalarSize : " << ScalarSize << "\n");
+    uint64_t ScalarSizeInBytes = (InsertOrd->getSExtValue()+1) * ScalarSize / 8;
     if (Offset.urem(ScalarSizeInBytes) != 0)
       return false;
 
