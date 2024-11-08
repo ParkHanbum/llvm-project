@@ -1831,15 +1831,20 @@ static Instruction *foldSelectICmpBinOp(SelectInst &SI, ICmpInst *ICI,
                                         InstCombinerImpl &IC) {
   Value *X, *Y;
   const APInt *C;
+  APInt ZeroVal;
   unsigned CmpLHSOpc;
   bool IsDisjoint = false;
   // Specially handling for X^Y==0 transformed to X==Y
+  LLVM_DEBUG(dbgs() << "=================& \n";CmpLHS->dump();CmpRHS->dump());
   if (match(TVal, m_c_BitwiseLogic(m_Specific(CmpLHS), m_Specific(CmpRHS)))) {
     X = CmpLHS;
     Y = CmpRHS;
-    APInt ZeroVal = APInt::getZero(CmpLHS->getType()->getScalarSizeInBits());
+    ZeroVal = APInt::getZero(CmpLHS->getType()->getScalarSizeInBits());
     C = const_cast<APInt *>(&ZeroVal);
     CmpLHSOpc = Instruction::Xor;
+
+  LLVM_DEBUG(dbgs() << "11=================& \n";CmpLHS->dump();CmpRHS->dump());
+    
   } else if ((match(CmpLHS, m_BinOp(m_Value(X), m_Value(Y))) &&
               match(CmpRHS, m_APInt(C))) &&
              (match(TVal, m_c_BinOp(m_Specific(X), m_Value())) ||
@@ -1853,6 +1858,8 @@ static Instruction *foldSelectICmpBinOp(SelectInst &SI, ICmpInst *ICI,
   } else
     return nullptr;
 
+
+  LLVM_DEBUG(dbgs() << "================== " << CmpLHSOpc << Instruction::Xor << "\n";CmpLHS->dump();CmpRHS->dump(); C->dump(); );
   enum SpecialKnownBits {
     NothingSpecial = 0,
     NoCommonBits = 1 << 1,
@@ -1863,6 +1870,8 @@ static Instruction *foldSelectICmpBinOp(SelectInst &SI, ICmpInst *ICI,
   // We cannot know exactly what bits is known in X Y.
   // Instead, we just know what relationship exist for.
   auto isSpecialKnownBitsFor = [&]() -> unsigned {
+
+    LLVM_DEBUG(dbgs() << "================== " << CmpLHSOpc << Instruction::Xor << "\n";CmpLHS->dump();CmpRHS->dump(); C->dump(); );
     if (CmpLHSOpc == Instruction::And) {
       if (C->isZero())
         return NoCommonBits;
@@ -1894,6 +1903,7 @@ static Instruction *foldSelectICmpBinOp(SelectInst &SI, ICmpInst *ICI,
   unsigned XOrder = hasOperandAt(TValBop, X);
   unsigned YOrder = hasOperandAt(TValBop, Y);
   unsigned SKB = isSpecialKnownBitsFor();
+  LLVM_DEBUG(dbgs() << "================== " << SKB << " \n");
 
   KnownBits Known;
   if (TValBop->isBitwiseLogicOp()) {
