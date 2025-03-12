@@ -2578,10 +2578,14 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
   for (unsigned M = 0, E = Ty->getNumElements(); M < E; ++M)
     Start[M] = lookThroughShuffles(&*I.use_begin(), M);
 
+  LLVM_DEBUG(dbgs() << "Start size  : " << Start.size(); I.dump(); );
+
   SmallVector<SmallVector<InstLane>> Worklist;
   Worklist.push_back(Start);
   SmallPtrSet<Use *, 4> IdentityLeafs, SplatLeafs, ConcatLeafs;
   unsigned NumVisited = 0;
+  // 
+  bool IdentityLeafsHasPoison = false;
 
   while (!Worklist.empty()) {
     if (++NumVisited > MaxInstrsToScan)
@@ -2589,6 +2593,9 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
 
     SmallVector<InstLane> Item = Worklist.pop_back_val();
     auto [FrontU, FrontLane] = Item.front();
+    LLVM_DEBUG(dbgs() << "foldShuffleToIdentity : " << Item.size() << " / "
+                      << FrontLane << "\n";
+               FrontU->get()->dump(););
 
     // If we found an undef first lane then bail out to keep things simple.
     if (!FrontU)
@@ -2604,14 +2611,29 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
     if (FrontLane == 0 &&
         cast<FixedVectorType>(FrontU->get()->getType())->getNumElements() ==
             Ty->getNumElements() &&
-        all_of(drop_begin(enumerate(Item)), [IsEquiv, Item](const auto &E) {
-          Value *FrontV = Item.front().first->get();
-          return !E.value().first || (IsEquiv(E.value().first->get(), FrontV) &&
-                                      E.value().second == (int)E.index());
-        })) {
+        all_of(drop_begin(enumerate(Item)),
+               [IsEquiv, Item, &IdentityLeafsHasPoison](const auto &E) {
+                 Value *FrontV = Item.front().first->get();
+                 if (E.value().first == nullptr || E.value().second < 0)
+                   IdentityLeafsHasPoison = true;
+                 if (!E.value().first ||
+                     (IsEquiv(E.value().first->get(), FrontV) &&
+                      E.value().second == (int)E.index())) {
+                   if (E.value().first)
+                     LLVM_DEBUG(dbgs() << " E.value : ";
+                                E.value().first->get()->dump(););
+                   LLVM_DEBUG(dbgs() << " FrontV : "; FrontV->dump(););
+                   LLVM_DEBUG(dbgs() << " E.index : " << (int)E.index());
+                   LLVM_DEBUG(dbgs() << " E.value.enum : " << E.value().second);
+                   return true;
+                 }
+                 return false;
+               })) {
+      LLVM_DEBUG(dbgs() << "insert : " ; FrontU->get()->dump());
       IdentityLeafs.insert(FrontU);
       continue;
     }
+    LLVM_DEBUG(dbgs() << "foldShuffleToIdentity : \n");
     // Look for constants, for the moment only supporting constant splats.
     if (auto *C = dyn_cast<Constant>(FrontU);
         C && C->getSplatValue() &&
@@ -2642,6 +2664,7 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
       if (!IL.first)
         return true;
       Value *V = IL.first->get();
+      LLVM_DEBUG(dbgs() << "CheckLaneIsEquivalentToFirst : \n"; FrontV->dump(););
       if (auto *I = dyn_cast<Instruction>(V); I && !I->hasOneUse())
         return false;
       if (V->getValueID() != FrontV->getValueID())
@@ -2723,10 +2746,8 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
     return false;
   }
 
-  if (NumVisited <= 1)
+  if (NumVisited <= 1 && (IdentityLeafsHasPoison || IdentityLeafs.size() != 1))
     return false;
-
-  LLVM_DEBUG(dbgs() << "Found a superfluous identity shuffle: " << I << "\n");
 
   // If we got this far, we know the shuffles are superfluous and can be
   // removed. Scan through again and generate the new tree of instructions.
