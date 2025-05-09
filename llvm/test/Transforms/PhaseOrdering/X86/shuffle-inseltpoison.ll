@@ -274,6 +274,19 @@ define <4 x i32> @shuffle_16_bitcast_32_shuffle_32_can_not_be_converted_up(<8 x 
   ret <4 x i32> %shuffle2
 }
 
+define <4 x i32> @shuffle_16_bitcast_32_shuffle_32_can_not_be_converted_up_match_lane(<8 x i16> %v1) {
+; CHECK-LABEL: @shuffle_16_bitcast_32_shuffle_32_can_not_be_converted_up(
+; CHECK-NEXT:    [[SHUFFLE1:%.*]] = shufflevector <8 x i16> [[V1:%.*]], <8 x i16> poison, <8 x i32> <i32 5, i32 4, i32 6, i32 7, i32 2, i32 3, i32 0, i32 1>
+; CHECK-NEXT:    [[BC1:%.*]] = bitcast <8 x i16> [[SHUFFLE1]] to <4 x i32>
+; CHECK-NEXT:    [[SHUFFLE2:%.*]] = shufflevector <4 x i32> [[BC1]], <4 x i32> poison, <4 x i32> <i32 2, i32 3, i32 1, i32 0>
+; CHECK-NEXT:    ret <4 x i32> [[SHUFFLE2]]
+;
+  %shuffle1 = shufflevector <8 x i16> %v1, <8 x i16> poison, <8 x i32> <i32 4, i32 5, i32 6, i32 7, i32 2, i32 3, i32 0, i32 1>
+  %bc1 = bitcast <8 x i16> %shuffle1 to <4 x i32>
+  %shuffle2 = shufflevector <4 x i32> %bc1, <4 x i32> poison, <4 x i32> <i32 3, i32 2, i32 0, i32 1>
+  ret <4 x i32> %shuffle2
+}
+
 ; shuffle<8 x i16>( bitcast<8 x i16>( shuffle<16 x i8>(v)))
 
 define <8 x i16> @shuffle_8_bitcast_16_shuffle_16_can__be_converted_up(<16 x i8> %v1) {

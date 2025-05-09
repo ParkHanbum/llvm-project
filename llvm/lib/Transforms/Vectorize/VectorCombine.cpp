@@ -2496,6 +2496,66 @@ generateInstLaneVectorFromOperand(ArrayRef<InstLane> Item, int Op) {
   return NItem;
 }
 
+static SmallVector<InstLane>
+generateInstLaneVectorFromOperand2(ArrayRef<InstLane> Item, int Op, int SrcElNum, int DstElNum) {
+  unsigned Multiple =
+      SrcElNum > DstElNum ? SrcElNum / DstElNum : DstElNum / SrcElNum;
+      dbgs() << "SrcElNum : " << SrcElNum << " DstElNum : " << DstElNum << " Multiple : " << Multiple << "\n";
+  SmallVector<InstLane> NItem;
+  if (SrcElNum < DstElNum) {
+    // SV<0, 1> -> SV<0, 1, 2, 3>
+    SmallVector<InstLane> Lanes;
+    for (unsigned Idx = 0; Idx < SrcElNum; Idx++) {
+      auto [U, Lane] = Item[Idx];
+      for (unsigned Didx = 0; Didx < Multiple; Didx++) {
+        InstLane OpLane =
+            lookThroughShuffles(&cast<Instruction>(U->get())->getOperandUse(Op),
+                                Lane * Multiple + Didx);
+        Lanes.push_back(OpLane);
+      }
+      
+      // validate Lanes
+      // ...
+      for (InstLane IL : Lanes) {
+        auto [U, Lane] = IL;
+        dbgs() << "Lane : " << Lane; U->get()->dump(); 
+      }
+
+      NItem.push_back(Lanes[0]);
+    }
+  } else {
+    // SV<0, 1, 2, 3> -> SV<0, 1>
+    for (InstLane IL : Item) {
+      SmallVector<InstLane> Lanes;
+      auto [U, Lane] = IL;
+      dbgs() << "SrcLane : " << Lane;
+      for (unsigned Idx = 0; Idx < Multiple; Idx++) {
+        InstLane OpLane =
+            lookThroughShuffles(&cast<Instruction>(U->get())->getOperandUse(Op),
+                                Lane * Multiple + Idx);
+        Lanes.push_back(OpLane);
+        dbgs() << "\t DstLane : " << OpLane.second;
+      }
+      dbgs() << "\n"; 
+
+    // validation lanes
+    // ...
+    auto [FirstU, FirstLane] = Lanes[0];
+    dbgs() << "Lane : " << FirstLane; FirstU->get()->dump(); 
+    for (int I = 1; I < Lanes.size(); I++) {
+      auto IL = Lanes[I];
+      if (IL.first != FirstU || IL.second != FirstLane + I)
+        dbgs() << " This is wrong ...... \n";
+      dbgs() << "Lane : " << IL.second; IL.first->get()->dump(); 
+    }
+
+    NItem.append(Lanes);
+  }
+  }
+
+  return NItem;
+}
+
 /// Detect concat of multiple values into a vector
 static bool isFreeConcat(ArrayRef<InstLane> Item, TTI::TargetCostKind CostKind,
                          const TargetTransformInfo &TTI) {
@@ -2648,18 +2708,35 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
     if (!FrontU)
       return false;
 
+    
+    dbgs() << "New iteration ====================== \n" <<   " Lane : " << FrontLane << " Front : "; FrontU->get()->dump();
+    for (InstLane IL : Item) {
+      auto [U, Lane] = IL;
+      dbgs() << " Lane : " << Lane << " U : ";
+      U->get()->dump();
+    }
+    dbgs() << "New iteration ====================== \n";
+
     // Helper to peek through bitcasts to the same value.
     auto IsEquiv = [&](Value *X, Value *Y) {
       return X->getType() == Y->getType() &&
              peekThroughBitcasts(X) == peekThroughBitcasts(Y);
     };
 
+    dbgs() << " FuNumEl : " << cast<FixedVectorType>(FrontU->get()->getType())->getNumElements();
+    dbgs() << " TyNumEl : " << Ty->getNumElements() << "\n";
+
     // Look for an identity value.
     if (FrontLane == 0 &&
-        cast<FixedVectorType>(FrontU->get()->getType())->getNumElements() ==
-            Ty->getNumElements() &&
+        // cast<FixedVectorType>(FrontU->get()->getType())->getNumElements() ==
+        //     Ty->getNumElements() &&
         all_of(drop_begin(enumerate(Item)), [IsEquiv, Item](const auto &E) {
           Value *FrontV = Item.front().first->get();
+          dbgs() << "======= all of =========== \n";
+          if (E.value().first) {
+            E.value().first->get()->dump(); FrontV->dump(); 
+            dbgs() << " E.value().second  : " << E.value().second << " (int)E.index() : " << (int)E.index() << "\n"; 
+          }
           return !E.value().first || (IsEquiv(E.value().first->get(), FrontV) &&
                                       E.value().second == (int)E.index());
         })) {
@@ -2735,13 +2812,42 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
         Worklist.push_back(generateInstLaneVectorFromOperand(Item, 0));
         continue;
       } else if (auto *BitCast = dyn_cast<BitCastInst>(FrontU)) {
+        dbgs() << "what am I doing? " << "\n";
         // TODO: Handle vector widening/narrowing bitcasts.
         auto *DstTy = dyn_cast<FixedVectorType>(BitCast->getDestTy());
         auto *SrcTy = dyn_cast<FixedVectorType>(BitCast->getSrcTy());
-        if (DstTy && SrcTy &&
-            SrcTy->getNumElements() == DstTy->getNumElements()) {
-          Worklist.push_back(generateInstLaneVectorFromOperand(Item, 0));
-          continue;
+        DstTy->dump();SrcTy->dump();
+        // %bc1 = bitcast <8 x i16> %shuffle1 to <4 x i32>
+        // 0 = %shuffle1
+        // item.
+        I.dump();
+        for (InstLane IL : Item) {
+          auto [U, Lane] = IL;
+          dbgs() << " Lane : " << Lane << " U : ";
+          U->get()->dump();
+        }
+        unsigned SrcElNum = SrcTy->getNumElements();
+        unsigned DstElNum = DstTy->getNumElements();
+        auto IsNotMultiply = SrcElNum > DstElNum ? SrcElNum % DstElNum : DstElNum % SrcElNum;
+        if (DstTy || SrcTy || !IsNotMultiply) {
+          if (SrcElNum == DstElNum) {
+            Worklist.push_back(generateInstLaneVectorFromOperand(Item, 0));
+            continue;
+          }
+          else if (SrcElNum < DstElNum) {
+            dbgs() << "narrowing \n";
+          } else {
+            dbgs() << "widening \n";
+            SmallVector<InstLane> tmp =
+                generateInstLaneVectorFromOperand2(Item, 0, SrcElNum, DstElNum);
+            for (InstLane IL : tmp) {
+              auto [U, Lane] = IL;
+              dbgs() << " Lane : " << Lane << " U : ";
+              U->get()->dump();
+            }
+            Worklist.push_back(tmp);
+            continue;
+          }
         }
       } else if (isa<SelectInst>(FrontU)) {
         Worklist.push_back(generateInstLaneVectorFromOperand(Item, 0));
