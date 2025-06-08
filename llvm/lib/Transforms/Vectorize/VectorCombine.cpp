@@ -19,7 +19,6 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/BasicAliasAnalysis.h"
-#include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/Loads.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
@@ -35,6 +34,7 @@
 #include <numeric>
 #include <queue>
 #include <set>
+#include <map>
 
 #define DEBUG_TYPE "vector-combine"
 #include "llvm/Transforms/Utils/InstructionWorklist.h"
@@ -47,9 +47,8 @@ STATISTIC(NumVecCmp, "Number of vector compares formed");
 STATISTIC(NumVecBO, "Number of vector binops formed");
 STATISTIC(NumVecCmpBO, "Number of vector compare + binop formed");
 STATISTIC(NumShufOfBitcast, "Number of shuffles moved after bitcast");
-STATISTIC(NumScalarOps, "Number of scalar unary + binary ops formed");
+STATISTIC(NumScalarBO, "Number of scalar binops formed");
 STATISTIC(NumScalarCmp, "Number of scalar compares formed");
-STATISTIC(NumScalarIntrinsic, "Number of scalar intrinsic calls formed");
 
 static cl::opt<bool> DisableVectorCombine(
     "disable-vector-combine", cl::init(false), cl::Hidden,
@@ -114,7 +113,7 @@ private:
   bool foldInsExtBinop(Instruction &I);
   bool foldInsExtVectorToShuffle(Instruction &I);
   bool foldBitcastShuffle(Instruction &I);
-  bool scalarizeOpOrCmp(Instruction &I);
+  bool scalarizeBinopOrCmp(Instruction &I);
   bool scalarizeVPIntrinsic(Instruction &I);
   bool foldExtractedCmps(Instruction &I);
   bool foldBinopOfReductions(Instruction &I);
@@ -1018,128 +1017,95 @@ bool VectorCombine::scalarizeVPIntrinsic(Instruction &I) {
   return true;
 }
 
-/// Match a vector op/compare/intrinsic with at least one
-/// inserted scalar operand and convert to scalar op/cmp/intrinsic followed
-/// by insertelement.
-bool VectorCombine::scalarizeOpOrCmp(Instruction &I) {
-  auto *UO = dyn_cast<UnaryOperator>(&I);
-  auto *BO = dyn_cast<BinaryOperator>(&I);
-  auto *CI = dyn_cast<CmpInst>(&I);
-  auto *II = dyn_cast<IntrinsicInst>(&I);
-  if (!UO && !BO && !CI && !II)
-    return false;
-
-  // TODO: Allow intrinsics with different argument types
-  // TODO: Allow intrinsics with scalar arguments
-  if (II && (!isTriviallyVectorizable(II->getIntrinsicID()) ||
-             !all_of(II->args(), [&II](Value *Arg) {
-               return Arg->getType() == II->getType();
-             })))
+/// Match a vector binop or compare instruction with at least one inserted
+/// scalar operand and convert to scalar binop/cmp followed by insertelement.
+bool VectorCombine::scalarizeBinopOrCmp(Instruction &I) {
+  CmpPredicate Pred = CmpInst::BAD_ICMP_PREDICATE;
+  Value *Ins0, *Ins1;
+  if (!match(&I, m_BinOp(m_Value(Ins0), m_Value(Ins1))) &&
+      !match(&I, m_Cmp(Pred, m_Value(Ins0), m_Value(Ins1))))
     return false;
 
   // Do not convert the vector condition of a vector select into a scalar
   // condition. That may cause problems for codegen because of differences in
   // boolean formats and register-file transfers.
   // TODO: Can we account for that in the cost model?
-  if (CI)
+  bool IsCmp = Pred != CmpInst::Predicate::BAD_ICMP_PREDICATE;
+  if (IsCmp)
     for (User *U : I.users())
       if (match(U, m_Select(m_Specific(&I), m_Value(), m_Value())))
         return false;
 
-  // Match constant vectors or scalars being inserted into constant vectors:
-  // vec_op [VecC0 | (inselt VecC0, V0, Index)], ...
-  SmallVector<Constant *> VecCs;
-  SmallVector<Value *> ScalarOps;
-  std::optional<uint64_t> Index;
-
-  auto Ops = II ? II->args() : I.operands();
-  for (Value *Op : Ops) {
-    Constant *VecC;
-    Value *V;
-    uint64_t InsIdx = 0;
-    VectorType *OpTy = cast<VectorType>(Op->getType());
-    if (match(Op, m_InsertElt(m_Constant(VecC), m_Value(V),
-                              m_ConstantInt(InsIdx)))) {
-      // Bail if any inserts are out of bounds.
-      if (OpTy->getElementCount().getKnownMinValue() <= InsIdx)
-        return false;
-      // All inserts must have the same index.
-      // TODO: Deal with mismatched index constants and variable indexes?
-      if (!Index)
-        Index = InsIdx;
-      else if (InsIdx != *Index)
-        return false;
-      VecCs.push_back(VecC);
-      ScalarOps.push_back(V);
-    } else if (match(Op, m_Constant(VecC))) {
-      VecCs.push_back(VecC);
-      ScalarOps.push_back(nullptr);
-    } else {
-      return false;
-    }
-  }
-
-  // Bail if all operands are constant.
-  if (!Index.has_value())
+  // Match against one or both scalar values being inserted into constant
+  // vectors:
+  // vec_op VecC0, (inselt VecC1, V1, Index)
+  // vec_op (inselt VecC0, V0, Index), VecC1
+  // vec_op (inselt VecC0, V0, Index), (inselt VecC1, V1, Index)
+  // TODO: Deal with mismatched index constants and variable indexes?
+  Constant *VecC0 = nullptr, *VecC1 = nullptr;
+  Value *V0 = nullptr, *V1 = nullptr;
+  uint64_t Index0 = 0, Index1 = 0;
+  if (!match(Ins0, m_InsertElt(m_Constant(VecC0), m_Value(V0),
+                               m_ConstantInt(Index0))) &&
+      !match(Ins0, m_Constant(VecC0)))
+    return false;
+  if (!match(Ins1, m_InsertElt(m_Constant(VecC1), m_Value(V1),
+                               m_ConstantInt(Index1))) &&
+      !match(Ins1, m_Constant(VecC1)))
     return false;
 
-  VectorType *VecTy = cast<VectorType>(I.getType());
-  Type *ScalarTy = VecTy->getScalarType();
+  bool IsConst0 = !V0;
+  bool IsConst1 = !V1;
+  if (IsConst0 && IsConst1)
+    return false;
+  if (!IsConst0 && !IsConst1 && Index0 != Index1)
+    return false;
+
+  auto *VecTy0 = cast<VectorType>(Ins0->getType());
+  auto *VecTy1 = cast<VectorType>(Ins1->getType());
+  if (VecTy0->getElementCount().getKnownMinValue() <= Index0 ||
+      VecTy1->getElementCount().getKnownMinValue() <= Index1)
+    return false;
+
+  // Bail for single insertion if it is a load.
+  // TODO: Handle this once getVectorInstrCost can cost for load/stores.
+  auto *I0 = dyn_cast_or_null<Instruction>(V0);
+  auto *I1 = dyn_cast_or_null<Instruction>(V1);
+  if ((IsConst0 && I1 && I1->mayReadFromMemory()) ||
+      (IsConst1 && I0 && I0->mayReadFromMemory()))
+    return false;
+
+  uint64_t Index = IsConst0 ? Index1 : Index0;
+  Type *ScalarTy = IsConst0 ? V1->getType() : V0->getType();
+  Type *VecTy = I.getType();
   assert(VecTy->isVectorTy() &&
+         (IsConst0 || IsConst1 || V0->getType() == V1->getType()) &&
          (ScalarTy->isIntegerTy() || ScalarTy->isFloatingPointTy() ||
           ScalarTy->isPointerTy()) &&
          "Unexpected types for insert element into binop or cmp");
 
   unsigned Opcode = I.getOpcode();
   InstructionCost ScalarOpCost, VectorOpCost;
-  if (CI) {
-    CmpInst::Predicate Pred = CI->getPredicate();
+  if (IsCmp) {
+    CmpInst::Predicate Pred = cast<CmpInst>(I).getPredicate();
     ScalarOpCost = TTI.getCmpSelInstrCost(
         Opcode, ScalarTy, CmpInst::makeCmpResultType(ScalarTy), Pred, CostKind);
     VectorOpCost = TTI.getCmpSelInstrCost(
         Opcode, VecTy, CmpInst::makeCmpResultType(VecTy), Pred, CostKind);
-  } else if (UO || BO) {
+  } else {
     ScalarOpCost = TTI.getArithmeticInstrCost(Opcode, ScalarTy, CostKind);
     VectorOpCost = TTI.getArithmeticInstrCost(Opcode, VecTy, CostKind);
-  } else {
-    IntrinsicCostAttributes ScalarICA(
-        II->getIntrinsicID(), ScalarTy,
-        SmallVector<Type *>(II->arg_size(), ScalarTy));
-    ScalarOpCost = TTI.getIntrinsicInstrCost(ScalarICA, CostKind);
-    IntrinsicCostAttributes VectorICA(
-        II->getIntrinsicID(), VecTy,
-        SmallVector<Type *>(II->arg_size(), VecTy));
-    VectorOpCost = TTI.getIntrinsicInstrCost(VectorICA, CostKind);
   }
-
-  // Fold the vector constants in the original vectors into a new base vector to
-  // get more accurate cost modelling.
-  Value *NewVecC = nullptr;
-  if (CI)
-    NewVecC = ConstantFoldCompareInstOperands(CI->getPredicate(), VecCs[0],
-                                              VecCs[1], *DL);
-  else if (UO)
-    NewVecC = ConstantFoldUnaryOpOperand(Opcode, VecCs[0], *DL);
-  else if (BO)
-    NewVecC = ConstantFoldBinaryOpOperands(Opcode, VecCs[0], VecCs[1], *DL);
-  else if (II->arg_size() == 2)
-    NewVecC = ConstantFoldBinaryIntrinsic(II->getIntrinsicID(), VecCs[0],
-                                          VecCs[1], II->getType(), II);
 
   // Get cost estimate for the insert element. This cost will factor into
   // both sequences.
-  InstructionCost OldCost = VectorOpCost;
-  InstructionCost NewCost =
-      ScalarOpCost + TTI.getVectorInstrCost(Instruction::InsertElement, VecTy,
-                                            CostKind, *Index, NewVecC);
-  for (auto [Op, VecC, Scalar] : zip(Ops, VecCs, ScalarOps)) {
-    if (!Scalar)
-      continue;
-    InstructionCost InsertCost = TTI.getVectorInstrCost(
-        Instruction::InsertElement, VecTy, CostKind, *Index, VecC, Scalar);
-    OldCost += InsertCost;
-    NewCost += !Op->hasOneUse() * InsertCost;
-  }
+  InstructionCost InsertCost = TTI.getVectorInstrCost(
+      Instruction::InsertElement, VecTy, CostKind, Index);
+  InstructionCost OldCost =
+      (IsConst0 ? 0 : InsertCost) + (IsConst1 ? 0 : InsertCost) + VectorOpCost;
+  InstructionCost NewCost = ScalarOpCost + InsertCost +
+                            (IsConst0 ? 0 : !Ins0->hasOneUse() * InsertCost) +
+                            (IsConst1 ? 0 : !Ins1->hasOneUse() * InsertCost);
 
   // We want to scalarize unless the vector variant actually has lower cost.
   if (OldCost < NewCost || !NewCost.isValid())
@@ -1147,26 +1113,20 @@ bool VectorCombine::scalarizeOpOrCmp(Instruction &I) {
 
   // vec_op (inselt VecC0, V0, Index), (inselt VecC1, V1, Index) -->
   // inselt NewVecC, (scalar_op V0, V1), Index
-  if (CI)
+  if (IsCmp)
     ++NumScalarCmp;
-  else if (UO || BO)
-    ++NumScalarOps;
   else
-    ++NumScalarIntrinsic;
+    ++NumScalarBO;
 
   // For constant cases, extract the scalar element, this should constant fold.
-  for (auto [OpIdx, Scalar, VecC] : enumerate(ScalarOps, VecCs))
-    if (!Scalar)
-      ScalarOps[OpIdx] = ConstantExpr::getExtractElement(
-          cast<Constant>(VecC), Builder.getInt64(*Index));
+  if (IsConst0)
+    V0 = ConstantExpr::getExtractElement(VecC0, Builder.getInt64(Index));
+  if (IsConst1)
+    V1 = ConstantExpr::getExtractElement(VecC1, Builder.getInt64(Index));
 
-  Value *Scalar;
-  if (CI)
-    Scalar = Builder.CreateCmp(CI->getPredicate(), ScalarOps[0], ScalarOps[1]);
-  else if (UO || BO)
-    Scalar = Builder.CreateNAryOp(Opcode, ScalarOps);
-  else
-    Scalar = Builder.CreateIntrinsic(ScalarTy, II->getIntrinsicID(), ScalarOps);
+  Value *Scalar =
+      IsCmp ? Builder.CreateCmp(Pred, V0, V1)
+            : Builder.CreateBinOp((Instruction::BinaryOps)Opcode, V0, V1);
 
   Scalar->setName(I.getName() + ".scalar");
 
@@ -1175,20 +1135,11 @@ bool VectorCombine::scalarizeOpOrCmp(Instruction &I) {
   if (auto *ScalarInst = dyn_cast<Instruction>(Scalar))
     ScalarInst->copyIRFlags(&I);
 
-  // Create a new base vector if the constant folding failed.
-  if (!NewVecC) {
-    SmallVector<Value *> VecCValues;
-    VecCValues.reserve(VecCs.size());
-    append_range(VecCValues, VecCs);
-    if (CI)
-      NewVecC = Builder.CreateCmp(CI->getPredicate(), VecCs[0], VecCs[1]);
-    else if (UO || BO)
-      NewVecC = Builder.CreateNAryOp(Opcode, VecCValues);
-    else
-      NewVecC =
-          Builder.CreateIntrinsic(VecTy, II->getIntrinsicID(), VecCValues);
-  }
-  Value *Insert = Builder.CreateInsertElement(NewVecC, Scalar, *Index);
+  // Fold the vector constants in the original vectors into a new base vector.
+  Value *NewVecC =
+      IsCmp ? Builder.CreateCmp(Pred, VecC0, VecC1)
+            : Builder.CreateBinOp((Instruction::BinaryOps)Opcode, VecC0, VecC1);
+  Value *Insert = Builder.CreateInsertElement(NewVecC, Scalar, Index);
   replaceValue(I, *Insert);
   return true;
 }
@@ -1345,6 +1296,7 @@ static void analyzeCostOfVecReduction(const IntrinsicInst &II,
   }
   CostAfterReduction = TTI.getArithmeticReductionCost(ReductionOpc, VecRedTy,
                                                       std::nullopt, CostKind);
+  return;
 }
 
 bool VectorCombine::foldBinopOfReductions(Instruction &I) {
@@ -1487,7 +1439,6 @@ static ScalarizationResult canScalarizeAccess(VectorType *VecTy, Value *Idx,
   // This is the number of elements of fixed vector types,
   // or the minimum number of elements of scalable vector types.
   uint64_t NumElements = VecTy->getElementCount().getKnownMinValue();
-  unsigned IntWidth = Idx->getType()->getScalarSizeInBits();
 
   if (auto *C = dyn_cast<ConstantInt>(Idx)) {
     if (C->getValue().ult(NumElements))
@@ -1495,10 +1446,7 @@ static ScalarizationResult canScalarizeAccess(VectorType *VecTy, Value *Idx,
     return ScalarizationResult::unsafe();
   }
 
-  // Always unsafe if the index type can't handle all inbound values.
-  if (!llvm::isUIntN(IntWidth, NumElements))
-    return ScalarizationResult::unsafe();
-
+  unsigned IntWidth = Idx->getType()->getScalarSizeInBits();
   APInt Zero(IntWidth, 0);
   APInt MaxElts(IntWidth, NumElements);
   ConstantRange ValidIndices(Zero, MaxElts);
@@ -1605,6 +1553,8 @@ bool VectorCombine::foldSingleElementStore(Instruction &I) {
 bool VectorCombine::scalarizeLoadExtract(Instruction &I) {
   Value *Ptr;
   if (!match(&I, m_Load(m_Value(Ptr))))
+
+
     return false;
 
   auto *LI = cast<LoadInst>(&I);
@@ -2104,8 +2054,8 @@ bool VectorCombine::foldShuffleOfSelects(Instruction &I) {
        (SI0FOp->getFastMathFlags() != SI1FOp->getFastMathFlags())))
     return false;
 
-  auto *SrcVecTy = cast<FixedVectorType>(T1->getType());
-  auto *DstVecTy = cast<FixedVectorType>(I.getType());
+  auto *SrcVecTy = dyn_cast<FixedVectorType>(T1->getType());
+  auto *DstVecTy = dyn_cast<FixedVectorType>(I.getType());
   auto SK = TargetTransformInfo::SK_PermuteTwoSrc;
   auto SelOp = Instruction::Select;
   InstructionCost OldCost = TTI.getCmpSelInstrCost(
@@ -2426,7 +2376,7 @@ bool VectorCombine::foldShuffleOfIntrinsics(Instruction &I) {
     } else {
       auto *VecTy = cast<FixedVectorType>(II0->getArgOperand(I)->getType());
       NewArgsTy.push_back(FixedVectorType::get(VecTy->getElementType(),
-                                               ShuffleDstTy->getNumElements()));
+                                               VecTy->getNumElements() * 2));
       NewCost += TTI.getShuffleCost(TargetTransformInfo::SK_PermuteTwoSrc,
                                     VecTy, OldMask, CostKind);
     }
@@ -2468,7 +2418,7 @@ static InstLane lookThroughShuffles(Use *U, int Lane) {
   while (auto *SV = dyn_cast<ShuffleVectorInst>(U->get())) {
     unsigned NumElts =
         cast<FixedVectorType>(SV->getOperand(0)->getType())->getNumElements();
-    int M = SV->getMaskValue(Lane);
+    int M = SV->getMaskValue((int)Lane);
     if (M < 0)
       return {nullptr, PoisonMaskElem};
     if (static_cast<unsigned>(M) < NumElts) {
@@ -2494,6 +2444,189 @@ generateInstLaneVectorFromOperand(ArrayRef<InstLane> Item, int Op) {
     NItem.emplace_back(OpLane);
   }
   return NItem;
+}
+
+static SmallVector<InstLane>
+generateInstLaneVectorFromOperand2(ArrayRef<InstLane> Item, int Op, int SrcElNum, int DstElNum) {
+  bool IsWiden = SrcElNum > DstElNum;
+  unsigned Scale = IsWiden ? SrcElNum / DstElNum : DstElNum / SrcElNum;
+  dbgs() << "SrcElNum : " << SrcElNum << " DstElNum : " << DstElNum << " Scale : " << Scale << "\n";
+  SmallVector<InstLane> NItem;
+  NItem.reserve(SrcElNum);
+
+  for (unsigned Idx = 0; Idx < SrcElNum; Idx++) {
+    SmallVector<InstLane> Lanes;
+    if (IsWiden) {
+      if (Idx % Scale)
+        continue;
+      // Widening
+      // %bc1 = bitcast <16 x i8> %shuffle1 to <4 x i32>
+      auto [U, Lane] = Item[Idx / Scale];
+      for (unsigned Didx = 0; Didx < Scale; Didx++) {
+        InstLane OpLane =
+            lookThroughShuffles(&cast<Instruction>(U->get())->getOperandUse(Op),
+                                Lane * Scale + Didx);
+        Lanes.push_back(OpLane);
+      }
+    } else {
+      // Narrowing
+      // %bc1 = bitcast <4 x i32> %shuffle1 to <16 x i8>
+      for (unsigned Didx = 0; Didx < Scale; Didx++)
+        Lanes.push_back(Item[Didx + Idx * Scale]);
+    }
+
+    // validate Lanes
+    // 각 Lanes의 U는 모두 같고, Lane은 0 + index의 값이여야 한다.
+    // Lanes의 0 번째 Lane 의 값은 반드시 멀티플의 배수여야 한다.
+    auto [FirstU, FirstLane] = Lanes[0];
+    dbgs() << "[First] Lane : " << FirstLane;
+    FirstU->get()->dump();
+    dbgs() << "=================[Final Results]========================\n";
+    for (InstLane IL : Lanes) {
+      auto [U, Lane] = IL;
+      dbgs() << " Lane : " << Lane << " U : ";
+      if (U)
+        U->get()->dump();
+    }
+    dbgs() << "=========================================\n";
+    if (FirstLane % Scale) {
+      NItem.clear();
+      return NItem;
+    }
+    for (int I = 1; I < Lanes.size(); I++) {
+      auto [U, Lane] = Lanes[I];
+      if (U != FirstU || Lane != FirstLane + I) {
+        dbgs() << " This is wrong ...... \n";
+        NItem.clear();
+        return NItem;
+      }
+    }
+
+    if (IsWiden) {
+      NItem.append(Lanes.begin(), Lanes.end());
+    } else {
+      // Narrowing
+      // %bc1 = bitcast <4 x i32> %shuffle1 to <16 x i8>
+      auto [U, Lane] = Item[Idx * Scale];
+      InstLane OpLane =
+          lookThroughShuffles(&cast<Instruction>(U->get())->getOperandUse(Op),
+                              Lane / Scale);
+      NItem.push_back(OpLane);
+    }
+  }
+
+  return NItem;
+}
+
+static bool
+generateInstLaneVectorFromOperand2(ArrayRef<InstLane> Item, int Op, int SrcElNum, int DstElNum,
+                                   SmallVector<InstLane> &NItem) {
+  float Multiple = (float)SrcElNum / (float)DstElNum;
+  dbgs() << "elnum : " << SrcElNum << " : " << DstElNum << " Multi : " << Multiple << " ITem : " << Item.size() << "\n";
+  // Widenning
+  // VC<1,0> -> VCN<2,3,0,1> 인 경우,
+  if (SrcElNum > DstElNum) {
+    if (SrcElNum % DstElNum)
+      return false;
+
+    unsigned Multiple = SrcElNum / DstElNum;
+    for (InstLane IL : Item) {
+      SmallVector<InstLane> Lanes;
+      auto [U, Lane] = IL;
+      if (!U) {
+        return false;
+      }
+      for (int Idx = 0; Idx < Multiple; Idx++) {
+        InstLane WidenOpLane =
+            lookThroughShuffles(&cast<Instruction>(U->get())->getOperandUse(Op),
+                                (float)Lane * (float)Multiple + Idx);
+
+        dbgs() << " Lane : " << (float)Lane * (float)Multiple + Idx << " Lane2 : " << WidenOpLane.second << "\n";
+        Lanes.emplace_back(WidenOpLane);
+      }
+
+      // Validation
+      auto [FirstU, FirstLane] = Lanes[0];
+      if (FirstLane % Multiple)
+        return false;
+      for (unsigned Idx = 1, Max = Lanes.size(); Idx < Max; Idx++) {
+        auto [U, Lane] = Lanes[Idx];
+        auto [PrevU, PrevLane] = Lanes[Idx - 1];
+        if (PrevU != U || PrevLane + 1 != Lane)
+          return false;
+      }
+
+      NItem.append(Lanes);
+    }
+  } else {
+    // Narrowing
+    // define <2 x i64> @PR61061(<2 x i64> noundef %vect) {
+    //   %bc0 = bitcast <2 x i64> %vect to <16 x i8>
+    //   %ptr = shufflevector <16 x i8> %bc0, <16 x i8> poison, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 0, i32 1, i32 2, i32 3>
+    //   %tmp = bitcast <16 x i8> %ptr to <2 x i64>
+    //   ret <2 x i64> %tmp
+    // }
+    // VCN<2,3,0,1> -> VC<1,0> 인 경우,
+    if (SrcElNum % DstElNum)
+      return false;
+
+    unsigned Multiple = DstElNum / SrcElNum;
+    SmallVector<InstLane> Lanes;
+    for (unsigned Idx = 0; Idx < SrcElNum; Idx++) {
+      int BlockSize = Item.size() / SrcElNum;
+      for (unsigned Curr = Idx * BlockSize, Max = (Idx + 1) * BlockSize; Curr < Max; Curr++) {
+        auto [U, Lane] = Item[Curr];
+        dbgs() << "=========================================\n";
+        dbgs() << " Lane : " << Lane << " U : ";
+        if (U)
+          U->get()->dump();
+        else
+          return false;
+
+        InstLane NarrowOpLane =
+            lookThroughShuffles(&cast<Instruction>(U->get())->getOperandUse(Op),
+                                (float)Lane * (float)Multiple);
+        dbgs() << " Lane :  " << NarrowOpLane.second;
+        NarrowOpLane.first->get()->dump();
+        Lanes.emplace_back(NarrowOpLane);
+      }
+
+      // Validation
+      auto [FirstU, FirstLane] = Lanes[0];
+      if (FirstLane % BlockSize)
+        return false;
+      for (unsigned Idx = 1, Max = Lanes.size(); Idx < Max; Idx++) {
+        auto [U, Lane] = Lanes[Idx];
+        auto [PrevU, PrevLane] = Lanes[Idx-1];
+        if (PrevU != U || PrevLane + 1 != Lane)
+          return false;
+      }
+
+      // dbgs() << "=========================================\n";
+      // dbgs() << " total Lane size : " << Lanes.size() << "\n";
+      // dbgs() << "=========================================\n";
+      // unsigned Curr = Idx * BlockSize;
+      // auto [U, Lane] = Lanes[Curr];
+      // for (unsigned Max = (Idx + 1) * BlockSize; Curr < Max; Curr++) {
+      //   dbgs() << " i : " << Idx << " Curr : " << Curr << " Max : " << Max << " \n";
+      //   if (!(U == Lanes[Curr].first && Lane == Lanes[Curr].second)) {
+      //     dbgs() << "This Narrowing is Corrupted \n";
+      //   }
+      // }
+      // NItem.emplace_back(InstLane{U, Lane});
+    }
+    dbgs() << "=================[Final Results]========================\n";
+    for (InstLane IL : NItem) {
+      auto [U, Lane] = IL;
+      dbgs() << " Lane : " << Lane << " U : ";
+      if (U)
+        U->get()->dump();
+    }
+    dbgs() << "=========================================\n";
+    NItem.append(Lanes);
+  }
+
+  return true;
 }
 
 /// Detect concat of multiple values into a vector
@@ -2533,11 +2666,22 @@ static Value *generateNewInstTree(ArrayRef<InstLane> Item, FixedVectorType *Ty,
                                   const SmallPtrSet<Use *, 4> &IdentityLeafs,
                                   const SmallPtrSet<Use *, 4> &SplatLeafs,
                                   const SmallPtrSet<Use *, 4> &ConcatLeafs,
+                                  SmallDenseMap<InstLane, bool> &VecScaleMap,
                                   IRBuilder<> &Builder,
                                   const TargetTransformInfo *TTI) {
   auto [FrontU, FrontLane] = Item.front();
+  dbgs() << "=================[ generateNewInstTree ]========================\n";
+  for (InstLane IL : Item) {
+    auto [U, Lane] = IL;
+    dbgs() << " Lane : " << Lane << " U : ";
+    if (U)
+      U->get()->dump();
+  }
+  dbgs() << "=========================================\n";
+  dbgs() << " generateNewINstTree : " << FrontLane << "  ";FrontU->get()->dump();
 
   if (IdentityLeafs.contains(FrontU)) {
+    dbgs() << " identityleaf contains FrontU : \n";
     return FrontU->get();
   }
   if (SplatLeafs.contains(FrontU)) {
@@ -2574,9 +2718,32 @@ static Value *generateNewInstTree(ArrayRef<InstLane> Item, FixedVectorType *Ty,
       Ops[Idx] = II->getOperand(Idx);
       continue;
     }
-    Ops[Idx] = generateNewInstTree(generateInstLaneVectorFromOperand(Item, Idx),
-                                   Ty, IdentityLeafs, SplatLeafs, ConcatLeafs,
+    dbgs() << "Fornt U : "; I->dump();
+
+    SmallVector<InstLane> NItem;
+    if (auto *BitCast = dyn_cast<BitCastInst>(FrontU)) {
+      auto *DstTy = dyn_cast<FixedVectorType>(BitCast->getDestTy());
+      auto *SrcTy = dyn_cast<FixedVectorType>(BitCast->getSrcTy());
+      unsigned SrcElNum = SrcTy->getNumElements();
+      unsigned DstElNum = DstTy->getNumElements();
+      if (SrcElNum == DstElNum) {
+        NItem = generateInstLaneVectorFromOperand(Item, Idx);
+      } else {
+        // NItem = generateInstLaneVectorFromOperand2(Item, Idx, SrcElNum, DstElNum);
+        // dbgs() << "NTIEM : " << NItem.size() << " SrcElNum : " << SrcElNum << "\n";
+        // assert(NItem.size() == SrcElNum && "We must get correctly NItem at this point."); 
+        if (!generateInstLaneVectorFromOperand2(Item, Idx, SrcElNum, DstElNum, NItem))
+          return nullptr;
+      }
+    }
+    else
+      NItem = generateInstLaneVectorFromOperand(Item, Idx);
+
+    Ops[Idx] = generateNewInstTree(NItem,
+                                   Ty, IdentityLeafs, SplatLeafs, ConcatLeafs, VecScaleMap,
                                    Builder, TTI);
+    dbgs() << "Idx : " << Idx << " OPS : ";
+    Ops[Idx]->dump();
   }
 
   SmallVector<Value *, 8> ValueList;
@@ -2587,25 +2754,30 @@ static Value *generateNewInstTree(ArrayRef<InstLane> Item, FixedVectorType *Ty,
   Type *DstTy =
       FixedVectorType::get(I->getType()->getScalarType(), Ty->getNumElements());
   if (auto *BI = dyn_cast<BinaryOperator>(I)) {
+    dbgs() << " Binaryoperator : \n";
     auto *Value = Builder.CreateBinOp((Instruction::BinaryOps)BI->getOpcode(),
                                       Ops[0], Ops[1]);
     propagateIRFlags(Value, ValueList);
     return Value;
   }
   if (auto *CI = dyn_cast<CmpInst>(I)) {
+    dbgs() << " Cmp : \n";
     auto *Value = Builder.CreateCmp(CI->getPredicate(), Ops[0], Ops[1]);
     propagateIRFlags(Value, ValueList);
     return Value;
   }
   if (auto *SI = dyn_cast<SelectInst>(I)) {
+    dbgs() << " Select : \n";
     auto *Value = Builder.CreateSelect(Ops[0], Ops[1], Ops[2], "", SI);
     propagateIRFlags(Value, ValueList);
     return Value;
   }
   if (auto *CI = dyn_cast<CastInst>(I)) {
+    dbgs() << " Cast : "; DstTy->dump();
     auto *Value = Builder.CreateCast((Instruction::CastOps)CI->getOpcode(),
                                      Ops[0], DstTy);
     propagateIRFlags(Value, ValueList);
+    dbgs() << " reach here? : "; Value->dump();
     return Value;
   }
   if (II) {
@@ -2633,6 +2805,7 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
     Start[M] = lookThroughShuffles(&*I.use_begin(), M);
 
   SmallVector<SmallVector<InstLane>> Worklist;
+  SmallDenseMap<InstLane, bool> VecScaleMap;
   Worklist.push_back(Start);
   SmallPtrSet<Use *, 4> IdentityLeafs, SplatLeafs, ConcatLeafs;
   unsigned NumVisited = 0;
@@ -2648,21 +2821,50 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
     if (!FrontU)
       return false;
 
+    dbgs() << "New iteration ====================== \n" <<   " Lane : " << FrontLane << " Front : "; FrontU->get()->dump();
+    for (InstLane IL : Item) {
+      auto [U, Lane] = IL;
+      dbgs() << " Lane : " << Lane << " U : ";
+      if (U) U->get()->dump();
+    }
+    dbgs() << "New iteration ====================== \n";
+
     // Helper to peek through bitcasts to the same value.
     auto IsEquiv = [&](Value *X, Value *Y) {
       return X->getType() == Y->getType() &&
              peekThroughBitcasts(X) == peekThroughBitcasts(Y);
     };
 
+    dbgs() << " FuNumEl : " << cast<FixedVectorType>(FrontU->get()->getType())->getNumElements();
+    dbgs() << " TyNumEl : " << Ty->getNumElements() << " size : " << Ty->getPrimitiveSizeInBits() << "\n";
+
+    auto FrontUTy = FrontU->get()->getType();
+    dbgs() << "Type size  FrontUTy: " << FrontUTy->getPrimitiveSizeInBits() << "\n";
+    bool Scaled = VecScaleMap[Item.front()];
+    bool MatchType;
+    if (Scaled) {
+      MatchType = FrontUTy->getPrimitiveSizeInBits() == Ty->getPrimitiveSizeInBits();
+    } else
+      MatchType = cast<FixedVectorType>(FrontU->get()->getType())->getNumElements() == Ty->getNumElements();
+    dbgs() << " MatchType : " << MatchType << " \n";
+
     // Look for an identity value.
     if (FrontLane == 0 &&
-        cast<FixedVectorType>(FrontU->get()->getType())->getNumElements() ==
-            Ty->getNumElements() &&
+        // Bitcast 에서는 두 타입이 다를 수 있다. 
+        // ex) %bc1 = bitcast <8 x i16> %shuffle1 to <4 x i32>
+        // bitcast일 경우 두 요소 수를 체크하지말고 스칼라 사이즈를 비교하도록 한다.
+        MatchType &&
         all_of(drop_begin(enumerate(Item)), [IsEquiv, Item](const auto &E) {
           Value *FrontV = Item.front().first->get();
+          dbgs() << "======= all of =========== \n";
+          if (E.value().first) {
+            E.value().first->get()->dump(); FrontV->dump(); 
+            dbgs() << " E.value().second  : " << E.value().second << " (int)E.index() : " << (int)E.index() << "\n"; 
+          }
           return !E.value().first || (IsEquiv(E.value().first->get(), FrontV) &&
                                       E.value().second == (int)E.index());
         })) {
+          dbgs() << "IIdentified !! Identified !! Identified !! dentified !! \n";
       IdentityLeafs.insert(FrontU);
       continue;
     }
@@ -2676,6 +2878,7 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
                         cast<Constant>(U->get())->getSplatValue() ==
                             cast<Constant>(FrontV)->getSplatValue());
         })) {
+          dbgs() << "??????????????????????2????\n";
       SplatLeafs.insert(FrontU);
       continue;
     }
@@ -2685,6 +2888,7 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
           auto [U, Lane] = IL;
           return !U || (U->get() == FrontU->get() && Lane == FrontLane);
         })) {
+          dbgs() << "???????????????????????1???\n";
       SplatLeafs.insert(FrontU);
       continue;
     }
@@ -2735,14 +2939,61 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
         Worklist.push_back(generateInstLaneVectorFromOperand(Item, 0));
         continue;
       } else if (auto *BitCast = dyn_cast<BitCastInst>(FrontU)) {
+        dbgs() << "what am I doing? " << "\n";
         // TODO: Handle vector widening/narrowing bitcasts.
         auto *DstTy = dyn_cast<FixedVectorType>(BitCast->getDestTy());
         auto *SrcTy = dyn_cast<FixedVectorType>(BitCast->getSrcTy());
-        if (DstTy && SrcTy &&
-            SrcTy->getNumElements() == DstTy->getNumElements()) {
+        
+        if (!DstTy || !SrcTy)
+          continue;
+
+        BitCast->dump();SrcTy->dump(); DstTy->dump();
+        unsigned SrcElNum = SrcTy->getNumElements();
+        unsigned DstElNum = DstTy->getNumElements();
+        if (SrcElNum == DstElNum) {
           Worklist.push_back(generateInstLaneVectorFromOperand(Item, 0));
           continue;
+        } else if (SrcElNum < DstElNum) {
+          dbgs() << "narrowing " << SrcElNum << " to " << " DstElNum " << DstElNum << "\n";
+          dbgs() << "=========================================\n";
+          SmallVector<InstLane> tmp;
+          // tmp = generateInstLaneVectorFromOperand2(Item, 0, SrcElNum, DstElNum);
+          if (generateInstLaneVectorFromOperand2(Item, 0, SrcElNum, DstElNum, tmp)) {
+          dbgs() << "=========================================\n";
+          for (InstLane IL : tmp) {
+            auto [U, Lane] = IL;
+            dbgs() << " Lane : " << Lane << " U : ";
+            if (U)
+              U->get()->dump();
+          }
+          dbgs() << "=========================================\n";
+          if (tmp.size()) {
+            VecScaleMap[tmp.front()] = true;
+            Worklist.push_back(tmp);
+            continue;
+          }
         }
+        } else {
+          dbgs() << "widening " << SrcElNum << " to " << " DstElNum " << DstElNum << "\n";
+          dbgs() << "=========================================\n";
+          SmallVector<InstLane> tmp;
+          // tmp = generateInstLaneVectorFromOperand2(Item, 0, SrcElNum, DstElNum);
+          if (generateInstLaneVectorFromOperand2(Item, 0, SrcElNum, DstElNum, tmp)) {
+          dbgs() << "=========================================\n";
+          for (InstLane IL : tmp) {
+            auto [U, Lane] = IL;
+            dbgs() << " Lane : " << Lane << " U : ";
+            if (U)
+              U->get()->dump();
+          }
+          dbgs() << "=========================================\n";
+          if (tmp.size()) {
+            VecScaleMap[tmp.front()] = true;
+            Worklist.push_back(tmp);
+            continue;
+          }
+        }
+      }
       } else if (isa<SelectInst>(FrontU)) {
         Worklist.push_back(generateInstLaneVectorFromOperand(Item, 0));
         Worklist.push_back(generateInstLaneVectorFromOperand(Item, 1));
@@ -2786,7 +3037,7 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
   // removed. Scan through again and generate the new tree of instructions.
   Builder.SetInsertPoint(&I);
   Value *V = generateNewInstTree(Start, Ty, IdentityLeafs, SplatLeafs,
-                                 ConcatLeafs, Builder, &TTI);
+                                 ConcatLeafs, VecScaleMap, Builder, &TTI);
   replaceValue(I, *V);
   return true;
 }
@@ -3574,7 +3825,7 @@ bool VectorCombine::run() {
     // This transform works with scalable and fixed vectors
     // TODO: Identify and allow other scalable transforms
     if (IsVectorType) {
-      MadeChange |= scalarizeOpOrCmp(I);
+      MadeChange |= scalarizeBinopOrCmp(I);
       MadeChange |= scalarizeLoadExtract(I);
       MadeChange |= scalarizeVPIntrinsic(I);
       MadeChange |= foldInterleaveIntrinsics(I);
