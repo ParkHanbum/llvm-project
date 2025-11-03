@@ -222,7 +222,9 @@ bool RecurrenceDescriptor::AddReductionVar(
 
   // Obtain the reduction start value from the value that comes from the loop
   // preheader.
-  Value *RdxStart = Phi->getIncomingValueForBlock(TheLoop->getLoopPreheader());
+  Value *RdxStart;
+  if (TheLoop->getLoopPreheader())
+    RdxStart = Phi->getIncomingValueForBlock(TheLoop->getLoopPreheader());
 
   // ExitInstruction is the single value which is used outside the loop.
   // We only allow for a single reduction value to be used outside the loop.
@@ -586,6 +588,9 @@ bool RecurrenceDescriptor::AddReductionVar(
   //       kept simple enough.
   collectCastInstrs(TheLoop, ExitInstruction, RecurrenceType, CastInsts,
                     MinWidthCastToRecurrenceType);
+
+  if (!RdxStart)
+    return false;
 
   // We found a reduction var if we have reached the original phi node and we
   // only have a single instruction with out-of-loop users.
@@ -1533,6 +1538,11 @@ bool InductionDescriptor::isInductionPHI(
     // don't currently know how to handled uniform PHIs.
     LLVM_DEBUG(
         dbgs() << "LV: PHI is a recurrence with respect to an outer loop.\n");
+    return false;
+  }
+
+  if (!AR->getLoop()->getLoopPreheader()) {
+    LLVM_DEBUG(dbgs() << "LV: Loop doesn't have a legal pre-header.\n");
     return false;
   }
 
