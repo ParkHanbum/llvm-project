@@ -7672,6 +7672,24 @@ Instruction *InstCombinerImpl::visitICmpInst(ICmpInst &I) {
           return CmpInst::Create(Instruction::ICmp, I.getPredicate(), V, Op1);
       }
     }
+
+    // 1. 피연산자의 비트 폭 확인 (i1인 경우는 이미 처리되었을 것이므로 i2
+    // 이상일 때)
+    unsigned BitWidth = Op0->getType()->getScalarSizeInBits();
+    if (BitWidth > 1) {
+      // 2. KnownBits 분석 수행
+      // I.getModule() 혹은 DL(DataLayout)을 사용하여 computeKnownBits 호출
+      KnownBits Known = computeKnownBits(Op0, &I);
+
+      // 3. 핵심 조건: LSB(0번 비트)를 제외한 모든 비트가 0인지 확인
+      // Known.Zero가 상위 (BitWidth - 1)개 비트를 모두 포함하고 있다면,
+      // 이 값은 0이거나 1(LSB)인 상태임.
+      if (Known.Zero.countLeadingOnes() >= BitWidth - 1) {
+        // icmp ne (val), 0 은 결국 LSB가 1인지 묻는 것과 같으므로
+        // 바로 trunc 명령어로 치환 가능
+        return new TruncInst(Op0, I.getType());
+      }
+    }
   }
 
   if (Instruction *Res = foldICmpTruncWithTruncOrExt(I, Q))
