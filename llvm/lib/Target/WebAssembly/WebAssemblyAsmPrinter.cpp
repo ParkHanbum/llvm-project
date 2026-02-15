@@ -218,12 +218,11 @@ void WebAssemblyAsmPrinter::emitGlobalVariable(const GlobalVariable *GV) {
 
   emitVisibility(Sym, GV->getVisibility(), !GV->isDeclaration());
   emitSymbolType(Sym);
-  if (GV->hasInitializer()) {
+  if (const Constant *Init = GV->getInitializer()) {
     assert(getSymbolPreferLocal(*GV) == Sym);
     emitLinkage(GV, Sym);
     OutStreamer->emitLabel(Sym);
-    // TODO: Actually emit the initializer value.  Otherwise the global has the
-    // default value for its type (0, ref.null, etc).
+    emitGlobalConstant(GV->getDataLayout(), Init);
     OutStreamer->addBlankLine();
   }
 }
