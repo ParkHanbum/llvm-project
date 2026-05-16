@@ -20,6 +20,70 @@ using namespace PatternMatch;
 
 #define DEBUG_TYPE "instcombine"
 
+static bool areOnlyLowBitsOfByteShiftedLoadUsed(const Instruction &I,
+                                                unsigned NewWidth) {
+  for (const User *U : I.users()) {
+    if (auto *Trunc = dyn_cast<TruncInst>(U)) {
+      if (Trunc->getType()->getScalarSizeInBits() <= NewWidth)
+        continue;
+      return false;
+    }
+
+    if (isa<ZExtInst, ICmpInst, SwitchInst>(U))
+      continue;
+
+    return false;
+  }
+
+  return true;
+}
+
+static Instruction *narrowByteShiftedLoad(InstCombinerImpl &IC,
+                                          BinaryOperator &I) {
+  Type *Ty = I.getType();
+  if (!Ty->isIntegerTy() || I.isExact())
+    return nullptr;
+
+  auto *LI = dyn_cast<LoadInst>(I.getOperand(0));
+  const APInt *ShAmt;
+  if (!LI || !LI->hasOneUse() || !LI->isSimple() ||
+      !match(I.getOperand(1), m_APInt(ShAmt)))
+    return nullptr;
+
+  unsigned BitWidth = Ty->getIntegerBitWidth();
+  if (!ShAmt->ult(BitWidth))
+    return nullptr;
+
+  unsigned ShAmtC = ShAmt->getZExtValue();
+  if (ShAmtC == 0 || ShAmtC % 8 != 0)
+    return nullptr;
+
+  unsigned NewWidth = BitWidth - ShAmtC;
+  if (NewWidth < 8 || !isPowerOf2_32(NewWidth))
+    return nullptr;
+
+  if (!areOnlyLowBitsOfByteShiftedLoadUsed(I, NewWidth))
+    return nullptr;
+
+  const DataLayout &DL = IC.getDataLayout();
+  uint64_t Offset = DL.isLittleEndian() ? ShAmtC / 8 : 0;
+  Type *NewTy = IntegerType::get(Ty->getContext(), NewWidth);
+
+  Value *Ptr = LI->getPointerOperand();
+  if (Offset != 0) {
+    Type *IdxTy = DL.getIndexType(Ptr->getType());
+    Ptr = IC.Builder.CreateInBoundsPtrAdd(
+        Ptr, ConstantInt::get(IdxTy, Offset), LI->getName() + ".shift");
+  }
+
+  LoadInst *NewLoad = IC.Builder.CreateAlignedLoad(
+      NewTy, Ptr, commonAlignment(LI->getAlign(), Offset), LI->getName());
+  NewLoad->setAAMetadata(LI->getAAMetadata());
+  NewLoad->copyMetadata(*LI, {LLVMContext::MD_invariant_load,
+                              LLVMContext::MD_noundef});
+  return new ZExtInst(NewLoad, Ty);
+}
+
 bool canTryToConstantAddTwoShiftAmounts(Value *Sh0, Value *ShAmt0, Value *Sh1,
                                         Value *ShAmt1) {
   // We have two shift amounts from two different shifts. The types of those
@@ -1290,6 +1354,9 @@ Instruction *InstCombinerImpl::visitLShr(BinaryOperator &I) {
     return X;
 
   if (Instruction *R = commonShiftTransforms(I))
+    return R;
+
+  if (Instruction *R = narrowByteShiftedLoad(*this, I))
     return R;
 
   Value *Op0 = I.getOperand(0), *Op1 = I.getOperand(1);
