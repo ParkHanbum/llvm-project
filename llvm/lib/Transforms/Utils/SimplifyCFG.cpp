@@ -2440,6 +2440,8 @@ static bool sinkCommonCodeFromPredecessors(BasicBlock *BB,
   if (UnconditionalPreds.size() < 2)
     return false;
 
+  bool NeedSplit = HaveNonUnconditionalPredecessors;
+
   // We take a two-step approach to tail sinking. First we scan from the end of
   // each block upwards in lockstep. If the n'th instruction from the end of each
   // block can be sunk, those instructions are added to ValuesToSink and we
@@ -2447,33 +2449,125 @@ static bool sinkCommonCodeFromPredecessors(BasicBlock *BB,
   // (because they're not identical in each instruction) we add these to
   // PHIOperands.
   // We prepopulate PHIOperands with the phis that already exist in BB.
-  DenseMap<const Use *, SmallVector<Value *, 4>> PHIOperands;
-  for (PHINode &PN : BB->phis()) {
-    SmallDenseMap<BasicBlock *, const Use *, 4> IncomingVals;
-    for (const Use &U : PN.incoming_values())
-      IncomingVals.insert({PN.getIncomingBlock(U), &U});
-    auto &Ops = PHIOperands[IncomingVals[UnconditionalPreds[0]]];
-    for (BasicBlock *Pred : UnconditionalPreds)
-      Ops.push_back(*IncomingVals[Pred]);
-  }
+  auto PopulatePHIOperands =
+      [&](ArrayRef<BasicBlock *> Preds,
+          DenseMap<const Use *, SmallVector<Value *, 4>> &PHIOperands) {
+        for (PHINode &PN : BB->phis()) {
+          SmallDenseMap<BasicBlock *, const Use *, 4> IncomingVals;
+          for (const Use &U : PN.incoming_values())
+            IncomingVals.insert({PN.getIncomingBlock(U), &U});
+          const Use *FirstIncoming = IncomingVals.lookup(Preds.front());
+          if (!FirstIncoming)
+            return false;
+          auto &Ops = PHIOperands[FirstIncoming];
+          for (BasicBlock *Pred : Preds) {
+            const Use *Incoming = IncomingVals.lookup(Pred);
+            if (!Incoming)
+              return false;
+            Ops.push_back(*Incoming);
+          }
+        }
+        return true;
+      };
 
+  auto AnalyzePreds =
+      [&](ArrayRef<BasicBlock *> Preds,
+          DenseMap<const Use *, SmallVector<Value *, 4>> &PHIOperands,
+          SmallPtrSet<Value *, 4> &InstructionsToSink, int &ScanIdx) {
+        PHIOperands.clear();
+        InstructionsToSink.clear();
+        ScanIdx = 0;
+
+        if (!PopulatePHIOperands(Preds, PHIOperands))
+          return false;
+
+        LockstepReverseIterator<true> LRI(Preds);
+        while (LRI.isValid() && canSinkInstructions(*LRI, PHIOperands)) {
+          LLVM_DEBUG(dbgs() << "SINK: instruction can be sunk: " << *(*LRI)[0]
+                            << "\n");
+          InstructionsToSink.insert_range(*LRI);
+          ++ScanIdx;
+          --LRI;
+        }
+
+        return ScanIdx != 0;
+      };
+
+  auto LastNonTerminator = [](BasicBlock *Pred) -> Instruction * {
+    return Pred->getTerminator()->getPrevNode();
+  };
+
+  auto CanBeInSameSinkSubset = [](Instruction *I, Instruction *I0) {
+    if (!I->isSameOperationAs(I0, Instruction::CompareUsingIntersectedAttrs))
+      return false;
+
+    const auto *CB0 = dyn_cast<CallBase>(I0);
+    if (!CB0)
+      return true;
+
+    const auto *CB = cast<CallBase>(I);
+    if (CB0->isIndirectCall() || CB->isIndirectCall())
+      return CB0->isIndirectCall() == CB->isIndirectCall();
+
+    return CB0->getCalledOperand() == CB->getCalledOperand();
+  };
+
+  DenseMap<const Use *, SmallVector<Value *, 4>> PHIOperands;
   int ScanIdx = 0;
   SmallPtrSet<Value*,4> InstructionsToSink;
-  LockstepReverseIterator<true> LRI(UnconditionalPreds);
-  while (LRI.isValid() &&
-         canSinkInstructions(*LRI, PHIOperands)) {
-    LLVM_DEBUG(dbgs() << "SINK: instruction can be sunk: " << *(*LRI)[0]
-                      << "\n");
-    InstructionsToSink.insert_range(*LRI);
-    ++ScanIdx;
-    --LRI;
+  bool UsedSinkSubset = false;
+  SmallVector<BasicBlock *, 4> SinkSubsetPreds;
+
+  if (!AnalyzePreds(UnconditionalPreds, PHIOperands, InstructionsToSink,
+                    ScanIdx)) {
+    SmallVector<BasicBlock *, 4> BestSubset;
+    int BestScanIdx = 0;
+
+    for (BasicBlock *AnchorPred : UnconditionalPreds) {
+      Instruction *AnchorI = LastNonTerminator(AnchorPred);
+      if (!AnchorI)
+        continue;
+
+      SmallVector<BasicBlock *, 4> CandidatePreds;
+      for (BasicBlock *Pred : UnconditionalPreds) {
+        Instruction *I = LastNonTerminator(Pred);
+        if (I && CanBeInSameSinkSubset(I, AnchorI))
+          CandidatePreds.push_back(Pred);
+      }
+
+      if (CandidatePreds.size() < 2 ||
+          CandidatePreds.size() < BestSubset.size())
+        continue;
+
+      DenseMap<const Use *, SmallVector<Value *, 4>> CandidatePHIOperands;
+      SmallPtrSet<Value *, 4> CandidateInstructionsToSink;
+      int CandidateScanIdx = 0;
+      if (!AnalyzePreds(CandidatePreds, CandidatePHIOperands,
+                        CandidateInstructionsToSink, CandidateScanIdx))
+        continue;
+
+      if (CandidatePreds.size() > BestSubset.size() ||
+          (CandidatePreds.size() == BestSubset.size() &&
+           CandidateScanIdx > BestScanIdx)) {
+        BestSubset = CandidatePreds;
+        BestScanIdx = CandidateScanIdx;
+      }
+    }
+
+    if (BestSubset.empty())
+      return false;
+
+    UnconditionalPreds = std::move(BestSubset);
+    NeedSplit = true;
+    UsedSinkSubset = true;
+    SinkSubsetPreds = UnconditionalPreds;
+    if (!AnalyzePreds(UnconditionalPreds, PHIOperands, InstructionsToSink,
+                      ScanIdx))
+      return false;
   }
 
-  // If no instructions can be sunk, early-return.
-  if (ScanIdx == 0)
-    return false;
-
   bool followedByDeoptOrUnreachable = IsBlockFollowedByDeoptOrUnreachable(BB);
+  LockstepReverseIterator<true> LRI(UnconditionalPreds);
 
   if (!followedByDeoptOrUnreachable) {
     // Check whether this is the pointer operand of a load/store.
@@ -2510,7 +2604,12 @@ static bool sinkCommonCodeFromPredecessors(BasicBlock *BB,
         }
       }
       LLVM_DEBUG(dbgs() << "SINK: #phi insts: " << NumPHIInsts << "\n");
-      return NumPHIInsts <= 1;
+      unsigned MaxNumPHIInsts = 1;
+      Instruction *I = (*LRI)[0];
+      if (const auto *CB = dyn_cast<CallBase>(I);
+          CB && !isSafeToSpeculativelyExecute(I))
+        MaxNumPHIInsts = std::max<unsigned>(MaxNumPHIInsts, CB->arg_size());
+      return NumPHIInsts <= MaxNumPHIInsts;
     };
 
     // We've determined that we are going to sink last ScanIdx instructions,
@@ -2581,12 +2680,13 @@ static bool sinkCommonCodeFromPredecessors(BasicBlock *BB,
 
   bool Changed = false;
 
-  if (HaveNonUnconditionalPredecessors) {
+  if (NeedSplit) {
     if (!followedByDeoptOrUnreachable) {
-      // It is always legal to sink common instructions from unconditional
-      // predecessors. However, if not all predecessors are unconditional,
-      // this transformation might be pessimizing. So as a rule of thumb,
-      // don't do it unless we'd sink at least one non-speculatable instruction.
+      // It is always legal to sink common instructions from selected
+      // unconditional predecessors. However, if not all predecessors
+      // participate, this transformation might be pessimizing. So as a rule of
+      // thumb, don't do it unless we'd sink at least one non-speculatable
+      // instruction.
       // See https://bugs.llvm.org/show_bug.cgi?id=30244
       LRI.reset();
       int Idx = 0;
@@ -2604,7 +2704,6 @@ static bool sinkCommonCodeFromPredecessors(BasicBlock *BB,
     }
 
     LLVM_DEBUG(dbgs() << "SINK: Splitting edge\n");
-    // We have a conditional edge and we're going to sink some instructions.
     // Insert a new block postdominating all blocks we're going to sink from.
     if (!SplitBlockPredecessors(BB, UnconditionalPreds, ".sink.split", DTU))
       // Edges couldn't be split.
@@ -2638,8 +2737,21 @@ static bool sinkCommonCodeFromPredecessors(BasicBlock *BB,
     NumSinkCommonInstrs++;
     Changed = true;
   }
-  if (SinkIdx != 0)
+  if (SinkIdx != 0) {
     ++NumSinkCommonCode;
+    LLVM_DEBUG(if (UsedSinkSubset) {
+      dbgs() << "SINK: subset common sink in ";
+      BB->getParent()->printAsOperand(dbgs(), false);
+      dbgs() << " to ";
+      BB->printAsOperand(dbgs(), false);
+      dbgs() << " from";
+      for (BasicBlock *Pred : SinkSubsetPreds) {
+        dbgs() << " ";
+        Pred->printAsOperand(dbgs(), false);
+      }
+      dbgs() << "\n";
+    });
+  }
   return Changed;
 }
 

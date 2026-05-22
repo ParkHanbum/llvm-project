@@ -135,6 +135,8 @@ STATISTIC(NumRetsDup, "Number of return instructions duplicated");
 STATISTIC(NumDbgValueMoved, "Number of debug value instructions moved");
 STATISTIC(NumSelectsExpanded, "Number of selects turned into branches");
 STATISTIC(NumStoreExtractExposed, "Number of store(extractelement) exposed");
+STATISTIC(NumMaskedByteStores,
+          "Number of masked stores narrowed to byte stores");
 
 static cl::opt<bool> DisableBranchOpts(
     "disable-cgp-branch-opts", cl::Hidden, cl::init(false),
@@ -143,6 +145,10 @@ static cl::opt<bool> DisableBranchOpts(
 static cl::opt<bool>
     DisableGCOpts("disable-cgp-gc-opts", cl::Hidden, cl::init(false),
                   cl::desc("Disable GC optimizations in CodeGenPrepare"));
+
+static cl::opt<bool> LogMaskedByteStores(
+    "cgp-log-masked-byte-stores", cl::Hidden, cl::init(false),
+    cl::desc("Log masked byte store narrowing performed by CodeGenPrepare"));
 
 static cl::opt<bool>
     DisableSelectToBranch("disable-cgp-select2branch", cl::Hidden,
@@ -8661,6 +8667,114 @@ static bool splitMergedValStore(StoreInst &SI, const DataLayout &DL,
   return true;
 }
 
+static bool matchConstAnd(Value *V, Value *&X, const APInt *&C) {
+  return V->hasOneUse() && match(V, m_c_And(m_Value(X), m_APInt(C)));
+}
+
+static bool hasMemoryOpBetween(Instruction *From, Instruction *To) {
+  if (From->getParent() != To->getParent())
+    return true;
+
+  for (auto It = std::next(From->getIterator()), End = To->getIterator();
+       It != End; ++It)
+    if (It->mayReadOrWriteMemory() || It->mayThrow())
+      return true;
+  return false;
+}
+
+static bool matchByteInsertValue(Value *V, const APInt &Mask,
+                                 const DataLayout &DL, Value *&ByteValue,
+                                 uint64_t &ByteOffset) {
+  unsigned MaskIdx, MaskLen;
+  if (!Mask.isShiftedMask(MaskIdx, MaskLen) || MaskLen != 8 ||
+      MaskIdx % 8 != 0)
+    return false;
+
+  unsigned BitWidth = Mask.getBitWidth();
+  if (BitWidth <= 8 || BitWidth % 8 != 0)
+    return false;
+
+  ByteOffset =
+      DL.isLittleEndian() ? MaskIdx / 8 : (BitWidth - MaskIdx - MaskLen) / 8;
+
+  if (MaskIdx == 0) {
+    ByteValue = V;
+    return true;
+  }
+
+  const APInt *ShiftC;
+  if (!match(V, m_OneUse(m_Shl(m_Value(ByteValue), m_APInt(ShiftC)))) ||
+      ShiftC->uge(BitWidth) || ShiftC->getZExtValue() != MaskIdx)
+    return false;
+
+  auto *Shift = dyn_cast<Instruction>(V);
+  return !Shift || !Shift->hasPoisonGeneratingFlags();
+}
+
+static bool narrowMaskedByteStore(StoreInst &SI, const DataLayout &DL,
+                                  const TargetLowering &TLI) {
+  if (!SI.isSimple() || !SI.getValueOperand()->hasOneUse())
+    return false;
+
+  Type *StoreTy = SI.getValueOperand()->getType();
+  if (!StoreTy->isIntegerTy() || !DL.typeSizeEqualsStoreSize(StoreTy))
+    return false;
+
+  Value *Op0, *Op1, *X0, *X1;
+  const APInt *C0, *C1;
+  if (!match(SI.getValueOperand(), m_c_Or(m_Value(Op0), m_Value(Op1))) ||
+      !matchConstAnd(Op0, X0, C0) || !matchConstAnd(Op1, X1, C1))
+    return false;
+
+  auto TryNarrow = [&](Value *LoadVal, const APInt &LoadMask, Value *InsertVal,
+                       const APInt &InsertMask) -> bool {
+    auto *LI = dyn_cast<LoadInst>(LoadVal);
+    if (!LI || !LI->isSimple() || LI->getType() != StoreTy ||
+        LI->getPointerOperand() != SI.getPointerOperand() ||
+        hasMemoryOpBetween(LI, &SI) || LoadMask != ~InsertMask)
+      return false;
+
+    Value *ByteValue;
+    uint64_t ByteOffset;
+    if (!matchByteInsertValue(InsertVal, InsertMask, DL, ByteValue, ByteOffset))
+      return false;
+
+    Type *ByteTy = Type::getInt8Ty(SI.getContext());
+    EVT ByteVT = TLI.getValueType(DL, ByteTy);
+    Align ByteAlign = commonAlignment(SI.getAlign(), ByteOffset);
+    if (!TLI.allowsMemoryAccess(SI.getContext(), DL, ByteVT,
+                                SI.getPointerAddressSpace(), ByteAlign))
+      return false;
+
+    IRBuilder<> Builder(&SI);
+    Value *Addr = SI.getPointerOperand();
+    if (ByteOffset)
+      Addr = Builder.CreatePtrAdd(Addr, Builder.getInt64(ByteOffset));
+    Value *Trunc = Builder.CreateTruncOrBitCast(ByteValue, ByteTy);
+    StoreInst *NewSI = Builder.CreateAlignedStore(Trunc, Addr, ByteAlign);
+    NewSI->setDebugLoc(SI.getDebugLoc());
+
+    if (LogMaskedByteStores) {
+      errs() << "CGP-MASKED-BYTE-STORE function=";
+      SI.getFunction()->printAsOperand(errs(), /*PrintType=*/false);
+      errs() << " store-bits=" << StoreTy->getIntegerBitWidth()
+             << " byte-offset=" << ByteOffset << " store-align="
+             << SI.getAlign().value() << " byte-align=" << ByteAlign.value()
+             << " ir=";
+      SI.print(errs());
+      errs() << "\n";
+    }
+
+    Value *OldVal = SI.getValueOperand();
+    SI.eraseFromParent();
+    RecursivelyDeleteTriviallyDeadInstructions(OldVal);
+    ++NumMaskedByteStores;
+    return true;
+  };
+
+  return TryNarrow(X0, *C0, X1, *C1) || TryNarrow(X1, *C1, X0, *C0);
+}
+
 // Return true if the GEP has two operands, the first operand is of a sequential
 // type, and the second operand is a constant.
 static bool GEPSequentialConstIndexed(GetElementPtrInst *GEP) {
@@ -8983,6 +9097,8 @@ bool CodeGenPrepare::optimizeInst(Instruction *I, ModifyDT &ModifiedDT) {
   }
 
   if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+    if (narrowMaskedByteStore(*SI, *DL, *TLI))
+      return true;
     if (splitMergedValStore(*SI, *DL, *TLI))
       return true;
     SI->setMetadata(LLVMContext::MD_invariant_group, nullptr);
