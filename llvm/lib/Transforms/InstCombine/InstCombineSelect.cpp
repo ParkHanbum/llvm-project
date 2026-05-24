@@ -2203,6 +2203,39 @@ static Instruction *foldSelectICmpEq(SelectInst &SI, ICmpInst *ICI,
   return nullptr;
 }
 
+static Instruction *foldSelectICmpNullWithUMax(SelectInst &SI, ICmpInst *ICI,
+                                               InstCombinerImpl &IC) {
+  Value *X;
+  CmpPredicate Pred;
+  if (!match(ICI, m_c_ICmp(Pred, m_Value(X), m_Zero())) ||
+      Pred != ICmpInst::ICMP_EQ || !X->getType()->isPointerTy())
+    return nullptr;
+
+  if (!match(SI.getTrueValue(), m_One()))
+    return nullptr;
+
+  Value *Max;
+  if (!match(SI.getFalseValue(),
+             m_c_SpecificICmp(ICmpInst::ICMP_EQ, m_Value(Max), m_Zero())))
+    return nullptr;
+
+  if (Max->getType() != X->getType())
+    return nullptr;
+
+  unsigned AS = X->getType()->getPointerAddressSpace();
+  if (!IC.getDataLayout().getNullPtrValue(AS).isZero())
+    return nullptr;
+
+  Value *A, *B;
+  if (matchSelectPattern(Max, A, B).Flavor != SPF_UMAX)
+    return nullptr;
+
+  if (A != X && B != X)
+    return nullptr;
+
+  return IC.replaceInstUsesWith(SI, ICI);
+}
+
 /// Fold `X Pred C1 ? X BOp C2 : C1 BOp C2` to `min/max(X, C1) BOp C2`.
 /// This allows for better canonicalization.
 Value *InstCombinerImpl::foldSelectWithConstOpToBinOp(ICmpInst *Cmp,
@@ -2382,6 +2415,9 @@ Instruction *InstCombinerImpl::foldSelectInstWithICmp(SelectInst &SI,
   Value *CmpRHS = ICI->getOperand(1);
 
   if (Instruction *NewSel = foldSelectICmpEq(SI, ICI, *this))
+    return NewSel;
+
+  if (Instruction *NewSel = foldSelectICmpNullWithUMax(SI, ICI, *this))
     return NewSel;
 
   // Canonicalize a signbit condition to use zero constant by swapping:
