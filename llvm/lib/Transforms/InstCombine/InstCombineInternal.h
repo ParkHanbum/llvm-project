@@ -447,6 +447,7 @@ private:
                          ShiftSemantics Semantics);
 
   Instruction *foldLShrOverflowBit(BinaryOperator &I);
+  Instruction *foldLShrOfAddCarryBit(BinaryOperator &I);
   Instruction *foldExtractOfOverflowIntrinsic(ExtractValueInst &EV);
   Instruction *foldIntrinsicWithOverflowCommon(IntrinsicInst *II);
   Instruction *foldIntrinsicIsFPClass(IntrinsicInst &II);

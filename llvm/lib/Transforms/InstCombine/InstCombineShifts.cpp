@@ -1088,6 +1088,44 @@ Instruction *InstCombinerImpl::foldLShrOverflowBit(BinaryOperator &I) {
   return new ZExtInst(Overflow, Ty);
 }
 
+// If Y's sign bit is known zero, then the sign bit of X & ~(X + Y) is set iff
+// X + Y has unsigned overflow.
+Instruction *InstCombinerImpl::foldLShrOfAddCarryBit(BinaryOperator &I) {
+  assert(I.getOpcode() == Instruction::LShr);
+
+  Type *Ty = I.getType();
+  unsigned BitWidth = Ty->getScalarSizeInBits();
+
+  const APInt *ShAmtAPInt = nullptr;
+  if (!match(I.getOperand(1), m_APInt(ShAmtAPInt)) ||
+      ShAmtAPInt->getZExtValue() != BitWidth - 1)
+    return nullptr;
+
+  Value *X = nullptr, *Sum = nullptr;
+  if (!match(I.getOperand(0),
+             m_OneUse(m_c_And(m_Value(X),
+                               m_OneUse(m_NotForbidPoison(m_Value(Sum)))))))
+    return nullptr;
+
+  auto *Add = dyn_cast<BinaryOperator>(Sum);
+  if (!Add || Add->getOpcode() != Instruction::Add)
+    return nullptr;
+
+  Value *Y = nullptr;
+  if (Add->getOperand(0) == X)
+    Y = Add->getOperand(1);
+  else if (Add->getOperand(1) == X)
+    Y = Add->getOperand(0);
+  else
+    return nullptr;
+
+  if (!computeKnownBits(Y, &I).isNonNegative())
+    return nullptr;
+
+  Value *Overflow = Builder.CreateICmpULT(Sum, X, "add.overflow");
+  return new ZExtInst(Overflow, Ty);
+}
+
 // Try to set nuw/nsw flags on shl or exact flag on lshr/ashr using knownbits.
 static bool setShiftFlags(BinaryOperator &I, const SimplifyQuery &Q) {
   assert(I.isShift() && "Expected a shift as input");
@@ -1600,6 +1638,9 @@ Instruction *InstCombinerImpl::visitLShr(BinaryOperator &I) {
       if (match(Op0, m_OneUse(m_c_And(m_Add(m_Value(X), m_AllOnes()),
                                       m_Not(m_Deferred(X))))))
         return new ZExtInst(Builder.CreateIsNull(X), Ty);
+
+      if (Instruction *Overflow = foldLShrOfAddCarryBit(I))
+        return Overflow;
     }
 
     Instruction *TruncSrc;
