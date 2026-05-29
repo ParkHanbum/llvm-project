@@ -3,6 +3,156 @@
 
 declare void @use(i32)
 declare void @use_vec(<2 x i8>)
+declare i8 @llvm.umin.i8(i8, i8)
+declare void @use_i8(i8)
+
+; -----------------------------------------------------------------------------
+; Positive tests
+; -----------------------------------------------------------------------------
+
+define i1 @fold_sub_nsw_umin_const(i8 %x) {
+; CHECK-LABEL: @fold_sub_nsw_umin_const(
+; CHECK-NEXT:    [[MIN:%.*]] = tail call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 10)
+; CHECK-NEXT:    tail call void @use_i8(i8 [[MIN]])
+; CHECK-NEXT:    [[SUB:%.*]] = sub nsw i8 [[X]], [[MIN]]
+; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[SUB]], 20
+; CHECK-NEXT:    ret i1 [[CMP]]
+;
+  %min = tail call i8 @llvm.umin.i8(i8 %x, i8 10)
+  tail call void @use_i8(i8 %min)
+  %sub = sub nsw i8 %x, %min
+  %cmp = icmp slt i8 %sub, 20
+  ret i1 %cmp
+}
+
+define i1 @fold_sub_nsw_umin_range(i8 %x, i8 range(i8 0, 100) %y, i8 range(i8 1, 20) %z) {
+; CHECK-LABEL: @fold_sub_nsw_umin_range(
+; CHECK-NEXT:    [[MIN:%.*]] = tail call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 [[Y:%.*]])
+; CHECK-NEXT:    tail call void @use_i8(i8 [[MIN]])
+; CHECK-NEXT:    [[SUB:%.*]] = sub nsw i8 [[X]], [[MIN]]
+; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[SUB]], [[Z:%.*]]
+; CHECK-NEXT:    ret i1 [[CMP]]
+;
+  %min = tail call i8 @llvm.umin.i8(i8 %x, i8 %y)
+  tail call void @use_i8(i8 %min)
+  %sub = sub nsw i8 %x, %min
+  %cmp = icmp slt i8 %sub, %z
+  ret i1 %cmp
+}
+
+define i1 @fold_sub_nsw_umin_zext(i8 %x, i6 %a, i4 %b) {
+; CHECK-LABEL: @fold_sub_nsw_umin_zext(
+; CHECK-NEXT:    [[Y:%.*]] = zext i6 [[A:%.*]] to i8
+; CHECK-NEXT:    [[BZ:%.*]] = zext i4 [[B:%.*]] to i8
+; CHECK-NEXT:    [[MIN:%.*]] = tail call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 [[Y]])
+; CHECK-NEXT:    tail call void @use_i8(i8 [[MIN]])
+; CHECK-NEXT:    [[SUB:%.*]] = sub nsw i8 [[X]], [[MIN]]
+; CHECK-NEXT:    [[CMP:%.*]] = icmp sle i8 [[SUB]], [[BZ]]
+; CHECK-NEXT:    ret i1 [[CMP]]
+;
+  %y = zext i6 %a to i8
+  %bz = zext i4 %b to i8
+  %z = add nuw nsw i8 %bz, 1
+  %min = tail call i8 @llvm.umin.i8(i8 %x, i8 %y)
+  tail call void @use_i8(i8 %min)
+  %sub = sub nsw i8 %x, %min
+  %cmp = icmp slt i8 %sub, %z
+  ret i1 %cmp
+}
+
+define i1 @fold_sub_nsw_umin_sgt_commuted(i8 %x, i8 range(i8 0, 100) %y, i8 range(i8 1, 20) %z) {
+; CHECK-LABEL: @fold_sub_nsw_umin_sgt_commuted(
+; CHECK-NEXT:    [[MIN:%.*]] = tail call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 [[Y:%.*]])
+; CHECK-NEXT:    tail call void @use_i8(i8 [[MIN]])
+; CHECK-NEXT:    [[SUB:%.*]] = sub nsw i8 [[X]], [[MIN]]
+; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i8 [[Z:%.*]], [[SUB]]
+; CHECK-NEXT:    ret i1 [[CMP]]
+;
+  %min = tail call i8 @llvm.umin.i8(i8 %x, i8 %y)
+  tail call void @use_i8(i8 %min)
+  %sub = sub nsw i8 %x, %min
+  %cmp = icmp sgt i8 %z, %sub
+  ret i1 %cmp
+}
+
+; -----------------------------------------------------------------------------
+; Negative tests
+; -----------------------------------------------------------------------------
+
+define i1 @no_fold_unconstrained_y_z(i8 %x, i8 %y, i8 %z) {
+; CHECK-LABEL: @no_fold_unconstrained_y_z(
+; CHECK-NEXT:    [[MIN:%.*]] = tail call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 [[Y:%.*]])
+; CHECK-NEXT:    tail call void @use_i8(i8 [[MIN]])
+; CHECK-NEXT:    [[SUB:%.*]] = sub nsw i8 [[X]], [[MIN]]
+; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[SUB]], [[Z:%.*]]
+; CHECK-NEXT:    ret i1 [[CMP]]
+;
+  %min = tail call i8 @llvm.umin.i8(i8 %x, i8 %y)
+  tail call void @use_i8(i8 %min)
+  %sub = sub nsw i8 %x, %min
+  %cmp = icmp slt i8 %sub, %z
+  ret i1 %cmp
+}
+
+define i1 @no_fold_without_nsw(i8 %x, i8 range(i8 0, 100) %y, i8 range(i8 1, 20) %z) {
+; CHECK-LABEL: @no_fold_without_nsw(
+; CHECK-NEXT:    [[MIN:%.*]] = tail call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 [[Y:%.*]])
+; CHECK-NEXT:    tail call void @use_i8(i8 [[MIN]])
+; CHECK-NEXT:    [[SUB:%.*]] = sub i8 [[X]], [[MIN]]
+; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[SUB]], [[Z:%.*]]
+; CHECK-NEXT:    ret i1 [[CMP]]
+;
+  %min = tail call i8 @llvm.umin.i8(i8 %x, i8 %y)
+  tail call void @use_i8(i8 %min)
+  %sub = sub i8 %x, %min
+  %cmp = icmp slt i8 %sub, %z
+  ret i1 %cmp
+}
+
+define i1 @no_fold_y_may_be_negative(i8 %x, i8 %y, i8 range(i8 1, 20) %z) {
+; CHECK-LABEL: @no_fold_y_may_be_negative(
+; CHECK-NEXT:    [[MIN:%.*]] = tail call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 [[Y:%.*]])
+; CHECK-NEXT:    tail call void @use_i8(i8 [[MIN]])
+; CHECK-NEXT:    [[SUB:%.*]] = sub nsw i8 [[X]], [[MIN]]
+; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[SUB]], [[Z:%.*]]
+; CHECK-NEXT:    ret i1 [[CMP]]
+;
+  %min = tail call i8 @llvm.umin.i8(i8 %x, i8 %y)
+  tail call void @use_i8(i8 %min)
+  %sub = sub nsw i8 %x, %min
+  %cmp = icmp slt i8 %sub, %z
+  ret i1 %cmp
+}
+
+define i1 @no_fold_z_may_not_be_positive(i8 %x, i8 range(i8 0, 100) %y, i8 %z) {
+; CHECK-LABEL: @no_fold_z_may_not_be_positive(
+; CHECK-NEXT:    [[MIN:%.*]] = tail call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 [[Y:%.*]])
+; CHECK-NEXT:    tail call void @use_i8(i8 [[MIN]])
+; CHECK-NEXT:    [[SUB:%.*]] = sub nsw i8 [[X]], [[MIN]]
+; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[SUB]], [[Z:%.*]]
+; CHECK-NEXT:    ret i1 [[CMP]]
+;
+  %min = tail call i8 @llvm.umin.i8(i8 %x, i8 %y)
+  tail call void @use_i8(i8 %min)
+  %sub = sub nsw i8 %x, %min
+  %cmp = icmp slt i8 %sub, %z
+  ret i1 %cmp
+}
+
+define i1 @no_fold_sum_may_overflow(i8 %x, i8 range(i8 100, 127) %y, i8 range(i8 40, 60) %z) {
+; CHECK-LABEL: @no_fold_sum_may_overflow(
+; CHECK-NEXT:    [[MIN:%.*]] = tail call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 [[Y:%.*]])
+; CHECK-NEXT:    tail call void @use_i8(i8 [[MIN]])
+; CHECK-NEXT:    [[SUB:%.*]] = sub nsw i8 [[X]], [[MIN]]
+; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[SUB]], [[Z:%.*]]
+; CHECK-NEXT:    ret i1 [[CMP]]
+;
+  %min = tail call i8 @llvm.umin.i8(i8 %x, i8 %y)
+  tail call void @use_i8(i8 %min)
+  %sub = sub nsw i8 %x, %min
+  %cmp = icmp slt i8 %sub, %z
+  ret i1 %cmp
+}
 
 define i1 @test_nuw_and_unsigned_pred(i64 %x) {
 ; CHECK-LABEL: @test_nuw_and_unsigned_pred(
