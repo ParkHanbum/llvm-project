@@ -14,8 +14,7 @@ define i1 @fold_sub_nsw_umin_const(i8 %x) {
 ; CHECK-LABEL: @fold_sub_nsw_umin_const(
 ; CHECK-NEXT:    [[MIN:%.*]] = tail call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 10)
 ; CHECK-NEXT:    tail call void @use_i8(i8 [[MIN]])
-; CHECK-NEXT:    [[SUB:%.*]] = sub nsw i8 [[X]], [[MIN]]
-; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[SUB]], 20
+; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[X]], 30
 ; CHECK-NEXT:    ret i1 [[CMP]]
 ;
   %min = tail call i8 @llvm.umin.i8(i8 %x, i8 10)
@@ -29,8 +28,8 @@ define i1 @fold_sub_nsw_umin_range(i8 %x, i8 range(i8 0, 100) %y, i8 range(i8 1,
 ; CHECK-LABEL: @fold_sub_nsw_umin_range(
 ; CHECK-NEXT:    [[MIN:%.*]] = tail call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 [[Y:%.*]])
 ; CHECK-NEXT:    tail call void @use_i8(i8 [[MIN]])
-; CHECK-NEXT:    [[SUB:%.*]] = sub nsw i8 [[X]], [[MIN]]
-; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[SUB]], [[Z:%.*]]
+; CHECK-NEXT:    [[TMP1:%.*]] = add nuw nsw i8 [[Y]], [[Z:%.*]]
+; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[X]], [[TMP1]]
 ; CHECK-NEXT:    ret i1 [[CMP]]
 ;
   %min = tail call i8 @llvm.umin.i8(i8 %x, i8 %y)
@@ -46,8 +45,8 @@ define i1 @fold_sub_nsw_umin_zext(i8 %x, i6 %a, i4 %b) {
 ; CHECK-NEXT:    [[BZ:%.*]] = zext i4 [[B:%.*]] to i8
 ; CHECK-NEXT:    [[MIN:%.*]] = tail call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 [[Y]])
 ; CHECK-NEXT:    tail call void @use_i8(i8 [[MIN]])
-; CHECK-NEXT:    [[SUB:%.*]] = sub nsw i8 [[X]], [[MIN]]
-; CHECK-NEXT:    [[CMP:%.*]] = icmp sle i8 [[SUB]], [[BZ]]
+; CHECK-NEXT:    [[TMP1:%.*]] = add nuw nsw i8 [[Y]], [[BZ]]
+; CHECK-NEXT:    [[CMP:%.*]] = icmp sle i8 [[X]], [[TMP1]]
 ; CHECK-NEXT:    ret i1 [[CMP]]
 ;
   %y = zext i6 %a to i8
@@ -64,8 +63,8 @@ define i1 @fold_sub_nsw_umin_sgt_commuted(i8 %x, i8 range(i8 0, 100) %y, i8 rang
 ; CHECK-LABEL: @fold_sub_nsw_umin_sgt_commuted(
 ; CHECK-NEXT:    [[MIN:%.*]] = tail call i8 @llvm.umin.i8(i8 [[X:%.*]], i8 [[Y:%.*]])
 ; CHECK-NEXT:    tail call void @use_i8(i8 [[MIN]])
-; CHECK-NEXT:    [[SUB:%.*]] = sub nsw i8 [[X]], [[MIN]]
-; CHECK-NEXT:    [[CMP:%.*]] = icmp sgt i8 [[Z:%.*]], [[SUB]]
+; CHECK-NEXT:    [[TMP1:%.*]] = add nuw nsw i8 [[Y]], [[Z:%.*]]
+; CHECK-NEXT:    [[CMP:%.*]] = icmp slt i8 [[X]], [[TMP1]]
 ; CHECK-NEXT:    ret i1 [[CMP]]
 ;
   %min = tail call i8 @llvm.umin.i8(i8 %x, i8 %y)

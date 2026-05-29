@@ -7743,6 +7743,59 @@ Instruction *InstCombinerImpl::foldICmpCommutative(CmpPredicate Pred,
   return nullptr;
 }
 
+/// Match:
+///   icmp slt/sle (sub nsw X, umin(X, Y)), Z
+/// or the commuted forms:
+///   icmp sgt/sge Z, (sub nsw X, umin(X, Y))
+///
+/// If Y >= 0 and Y + Z does not signed-overflow, then:
+///   (sub nsw X, umin(X, Y)) s<  Z  -->  X s<  Y + Z
+///   (sub nsw X, umin(X, Y)) s<= Z  -->  X s<= Y + Z
+///
+/// For the strict form, require Z > 0. For the non-strict form, require
+/// Z >= 0. This is needed for the X <u Y arm where the subtraction is zero.
+static Instruction *foldICmpSubNSWUmin(ICmpInst &I, IRBuilderBase &Builder,
+                                       const SimplifyQuery &SQ) {
+  Value *SubV, *Z;
+  ICmpInst::Predicate Pred = I.getPredicate(), NewPred;
+
+  if (Pred == ICmpInst::ICMP_SLT || Pred == ICmpInst::ICMP_SLE) {
+    SubV = I.getOperand(0);
+    Z = I.getOperand(1);
+    NewPred = Pred;
+  } else if (Pred == ICmpInst::ICMP_SGT || Pred == ICmpInst::ICMP_SGE) {
+    SubV = I.getOperand(1);
+    Z = I.getOperand(0);
+    NewPred = ICmpInst::getSwappedPredicate(Pred);
+  } else {
+    return nullptr;
+  }
+
+  Value *X, *Y;
+  if (!match(SubV, m_NSWSub(m_Value(X), m_c_UMin(m_Deferred(X), m_Value(Y)))))
+    return nullptr;
+
+  const SimplifyQuery Q = SQ.getWithInstruction(&I);
+  if (!isKnownNonNegative(Y, Q))
+    return nullptr;
+
+  if (NewPred == ICmpInst::ICMP_SLT) {
+    if (!isKnownPositive(Z, Q))
+      return nullptr;
+  } else {
+    if (!isKnownNonNegative(Z, Q))
+      return nullptr;
+  }
+
+  if (computeOverflowForSignedAdd(WithCache<const Value *>(Y),
+                                  WithCache<const Value *>(Z),
+                                  Q) != OverflowResult::NeverOverflows)
+    return nullptr;
+
+  Value *Sum = Builder.CreateNSWAdd(Y, Z);
+  return new ICmpInst(NewPred, X, Sum);
+}
+
 Instruction *InstCombinerImpl::visitICmpInst(ICmpInst &I) {
   bool Changed = false;
   const SimplifyQuery Q = SQ.getWithInstruction(&I);
@@ -8135,6 +8188,9 @@ Instruction *InstCombinerImpl::visitICmpInst(ICmpInst &I) {
       }
     }
   }
+
+  if (Instruction *R = foldICmpSubNSWUmin(I, Builder, Q))
+    return R;
 
   return Changed ? &I : nullptr;
 }
