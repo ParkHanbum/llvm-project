@@ -172,6 +172,36 @@ static Value *handleOtherCmpSelSimplifications(Value *TCmp, Value *FCmp,
   return nullptr;
 }
 
+/// If both operands are selects controlled by the same condition, compare the
+/// matching arms and return the common simplified result.
+static Value *threadCmpOverSameCondSelects(CmpPredicate Pred, Value *LHS,
+                                           Value *RHS, const SimplifyQuery &Q,
+                                           unsigned MaxRecurse) {
+  auto *LHSSelect = dyn_cast<SelectInst>(LHS);
+  auto *RHSSelect = dyn_cast<SelectInst>(RHS);
+  if (!LHSSelect || !RHSSelect ||
+      LHSSelect->getCondition() != RHSSelect->getCondition())
+    return nullptr;
+
+  Value *Cond = LHSSelect->getCondition();
+  Value *TrueCmp =
+      simplifyCmpSelTrueCase(Pred, LHSSelect->getTrueValue(),
+                             RHSSelect->getTrueValue(), Cond, Q, MaxRecurse);
+  if (!TrueCmp)
+    return nullptr;
+
+  Value *FalseCmp =
+      simplifyCmpSelFalseCase(Pred, LHSSelect->getFalseValue(),
+                              RHSSelect->getFalseValue(), Cond, Q, MaxRecurse);
+  if (!FalseCmp)
+    return nullptr;
+
+  if (TrueCmp == FalseCmp)
+    return TrueCmp;
+
+  return nullptr;
+}
+
 /// Does the given value dominate the specified phi node?
 static bool valueDominatesPHI(Value *V, PHINode *P, const DominatorTree *DT) {
   Instruction *I = dyn_cast<Instruction>(V);
@@ -435,6 +465,9 @@ static Value *threadCmpOverSelect(CmpPredicate Pred, Value *LHS, Value *RHS,
   // Recursion is always used, so bail out at once if we already hit the limit.
   if (!MaxRecurse--)
     return nullptr;
+
+  if (Value *V = threadCmpOverSameCondSelects(Pred, LHS, RHS, Q, MaxRecurse))
+    return V;
 
   // Make sure the select is on the LHS.
   if (!isa<SelectInst>(LHS)) {
