@@ -150,6 +150,7 @@ private:
   bool foldShuffleChainsToReduce(Instruction &I);
   bool foldCastFromReductions(Instruction &I);
   bool foldSignBitReductionCmp(Instruction &I);
+  bool foldReductionZeroTest(Instruction &I);
   bool foldICmpEqZeroVectorReduce(Instruction &I);
   bool foldEquivalentReductionCmp(Instruction &I);
   bool foldReduceAddCmpZero(Instruction &I);
@@ -4592,27 +4593,64 @@ bool VectorCombine::foldSignBitReductionCmp(Instruction &I) {
   return true;
 }
 
-/// vector.reduce.OP f(X_i) == 0 -> vector.reduce.OP X_i == 0
+/// Fold:
+///   icmp eq/ne (reduce.{or,umax} X), 0
+/// into:
+///   reduce.{and,or} (icmp eq/ne X, zeroinitializer)
 ///
-/// We can prove it for cases when:
-///
-///   1.  OP X_i == 0 <=> \forall i \in [1, N] X_i == 0
-///   1'. OP X_i == 0 <=> \exists j \in [1, N] X_j == 0
-///   2.  f(x) == 0 <=> x == 0
-///
-/// From 1 and 2 (or 1' and 2), we can infer that
-///
-///   OP f(X_i) == 0 <=> OP X_i == 0.
-///
-///                  (1)
-///   OP f(X_i) == 0 <=> \forall i \in [1, N] f(X_i) == 0
-///                  (2)
-///                  <=> \forall i \in [1, N] X_i == 0
-///                  (1)
-///                  <=> OP(X_i) == 0
-///
-/// For some of the OP's and f's, we need to have domain constraints on X
-/// to ensure properties 1 (or 1') and 2.
+/// A bitwise-or or unsigned-max reduction is zero exactly when every input
+/// lane is zero. Representing the zero-test as a vector compare followed by a
+/// boolean reduction preserves that idiom for target lowering.
+bool VectorCombine::foldReductionZeroTest(Instruction &I) {
+  CmpPredicate Pred;
+  Value *ReductionValue;
+  if (!match(&I, m_c_ICmp(Pred, m_Value(ReductionValue), m_ZeroInt())) ||
+      !ICmpInst::isEquality(Pred))
+    return false;
+
+  auto *Reduction = dyn_cast<IntrinsicInst>(ReductionValue);
+  if (!Reduction || !Reduction->hasOneUse())
+    return false;
+
+  Intrinsic::ID ReductionID = Reduction->getIntrinsicID();
+  if (ReductionID != Intrinsic::vector_reduce_or &&
+      ReductionID != Intrinsic::vector_reduce_umax)
+    return false;
+
+  Value *Vec = Reduction->getArgOperand(0);
+  auto *VecTy = dyn_cast<FixedVectorType>(Vec->getType());
+  if (!VecTy || !VecTy->getElementType()->isIntegerTy())
+    return false;
+
+  CmpPredicate LanePred = Pred;
+  Intrinsic::ID BoolReductionID = Pred == ICmpInst::ICMP_NE
+                                      ? Intrinsic::vector_reduce_or
+                                      : Intrinsic::vector_reduce_and;
+  auto *CmpTy = cast<VectorType>(CmpInst::makeCmpResultType(VecTy));
+
+  if (ReductionID == Intrinsic::vector_reduce_umax) {
+    InstructionCost OldCost = TTI.getInstructionCost(Reduction, CostKind) +
+                              TTI.getInstructionCost(&I, CostKind);
+    InstructionCost NewCost =
+        TTI.getCmpSelInstrCost(Instruction::ICmp, VecTy, CmpTy, LanePred,
+                               CostKind) +
+        TTI.getArithmeticReductionCost(
+            getArithmeticReductionInstruction(BoolReductionID), CmpTy,
+            std::nullopt, CostKind);
+    if (!OldCost.isValid() || !NewCost.isValid() || NewCost > OldCost)
+      return false;
+  }
+
+  Builder.SetInsertPoint(&I);
+  Value *Cmp = Builder.CreateICmp(LanePred, Vec, Constant::getNullValue(VecTy));
+  Value *NewReduction =
+      Builder.CreateIntrinsic(BoolReductionID, {CmpTy}, {Cmp});
+  replaceValue(I, *NewReduction);
+  return true;
+}
+
+/// Fold an equality comparison through operations that preserve comparison to
+/// zero. Some operations require domain constraints on their inputs.
 bool VectorCombine::foldICmpEqZeroVectorReduce(Instruction &I) {
   CmpPredicate Pred;
   Value *Op;
@@ -6264,6 +6302,8 @@ bool VectorCombine::run() {
         break;
       case Instruction::ICmp:
         if (foldSignBitReductionCmp(I))
+          return true;
+        if (foldReductionZeroTest(I))
           return true;
         if (foldICmpEqZeroVectorReduce(I))
           return true;
