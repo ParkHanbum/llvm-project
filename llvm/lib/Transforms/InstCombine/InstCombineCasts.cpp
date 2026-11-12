@@ -17,7 +17,9 @@
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Analysis/Loads.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/Instruction.h"
@@ -1060,6 +1062,82 @@ static Instruction *shrinkInsertElt(CastInst &Trunc,
   return nullptr;
 }
 
+// Narrowing a load before another load is CSE'd can split one value into
+// different byte values and prevent later vectorization of their uses.
+static bool hasReusableWideLoad(LoadInst &Load, AAResults &AA,
+                                const DataLayout &DL) {
+  Value *Ptr = Load.getPointerOperand();
+  constexpr unsigned ScanLimit = 32;
+  BatchAAResults BatchAA(AA);
+  unsigned UsesScanned = 0;
+  for (User *U : Ptr->users()) {
+    if (++UsesScanned > ScanLimit)
+      return true;
+
+    auto *Other = dyn_cast<LoadInst>(U);
+    if (!Other || Other == &Load || !Other->isSimple() ||
+        Other->getType() != Load.getType() ||
+        Other->getFunction() != Load.getFunction())
+      continue;
+
+    // Conservatively preserve possible reuse across basic blocks.
+    if (Other->getParent() != Load.getParent())
+      return true;
+
+    LoadInst *Earlier = &Load, *Later = Other;
+    if (Other->comesBefore(&Load))
+      std::swap(Earlier, Later);
+
+    // If the loads are too far apart, leave the decision to later passes.
+    unsigned Distance = 1;
+    for (Instruction *I = Later->getPrevNode(); I != Earlier;
+         I = I->getPrevNode())
+      if (++Distance > ScanLimit)
+        return true;
+
+    bool IsLoadCSE = false;
+    if (FindAvailableLoadedValue(Later, BatchAA, &IsLoadCSE, ScanLimit) ==
+            Earlier &&
+        IsLoadCSE)
+      return true;
+  }
+  // Equivalent GEPs may not have been combined when the trunc is visited.
+  // Look for nearby loads at the same base and constant offset, checking any
+  // intervening writes only when such a load is found.
+  APInt Offset(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
+  Value *Base = Ptr->stripAndAccumulateConstantOffsets(
+      DL, Offset, /*AllowNonInbounds=*/true);
+  auto ScanForReusableLoad = [&](auto It, auto End) {
+    SmallVector<Instruction *, 8> Writes;
+    unsigned Scanned = 0;
+    for (; It != End && Scanned++ < ScanLimit; ++It) {
+      Instruction &I = *It;
+      auto *Other = dyn_cast<LoadInst>(&I);
+      if (Other && Other->isSimple() && Other->getType() == Load.getType() &&
+          Other->getPointerAddressSpace() == Load.getPointerAddressSpace()) {
+        APInt OtherOffset(Offset.getBitWidth(), 0);
+        Value *OtherBase =
+            Other->getPointerOperand()->stripAndAccumulateConstantOffsets(
+                DL, OtherOffset, /*AllowNonInbounds=*/true);
+        if (Base == OtherBase && Offset == OtherOffset) {
+          MemoryLocation Loc = MemoryLocation::get(&Load);
+          for (Instruction *Write : Writes)
+            if (isModSet(BatchAA.getModRefInfo(Write, Loc)))
+              return false;
+          return true;
+        }
+      }
+      if (I.mayWriteToMemory())
+        Writes.push_back(&I);
+    }
+    return false;
+  };
+
+  return ScanForReusableLoad(++Load.getReverseIterator(),
+                             Load.getParent()->rend()) ||
+         ScanForReusableLoad(++Load.getIterator(), Load.getParent()->end());
+}
+
 Instruction *InstCombinerImpl::visitTrunc(TruncInst &Trunc) {
   if (Instruction *Result = commonCastTransforms(Trunc))
     return Result;
@@ -1068,6 +1146,53 @@ Instruction *InstCombinerImpl::visitTrunc(TruncInst &Trunc) {
   Type *DestTy = Trunc.getType(), *SrcTy = Src->getType();
   unsigned DestWidth = DestTy->getScalarSizeInBits();
   unsigned SrcWidth = SrcTy->getScalarSizeInBits();
+
+  // Fold a byte-aligned extraction of the high part of a load into the
+  // constant offset of its GEP. Restrict this to common scalar load types so
+  // we do not create unusual or potentially expensive memory operations.
+  //
+  // The original load must remain at its old position: moving the narrowed
+  // load to the trunc could otherwise cross a write to the same memory.
+  if (DL.isLittleEndian() && SrcTy->isIntegerTy() && DestTy->isIntegerTy() &&
+      (DestWidth == 8 || DestWidth == 16 || DestWidth == 32 ||
+       DestWidth == 64) &&
+      SrcWidth % 8 == 0 && shouldChangeType(SrcTy, DestTy)) {
+    const APInt *ShiftAmt;
+    Value *Ptr;
+    if (match(Src, m_OneUse(m_LShr(m_OneUse(m_Load(m_Value(Ptr))),
+                                   m_APInt(ShiftAmt)))) &&
+        *ShiftAmt == SrcWidth - DestWidth) {
+      auto *Load = cast<LoadInst>(cast<Instruction>(Src)->getOperand(0));
+      auto *GEP = dyn_cast<GEPOperator>(Ptr);
+      unsigned AS = Load->getPointerAddressSpace();
+      // Be conservative for address spaces where GEP arithmetic uses fewer
+      // bits than the pointer representation.
+      if (Load->isSimple() && GEP &&
+          DL.getIndexSizeInBits(AS) == DL.getPointerSizeInBits(AS)) {
+        APInt Offset(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
+        if (GEP->accumulateConstantOffset(DL, Offset) &&
+            !hasReusableWideLoad(*Load, *AA, DL)) {
+          uint64_t ByteOffset = (SrcWidth - DestWidth) / 8;
+          Offset += ByteOffset;
+          IRBuilderBase::InsertPointGuard Guard(Builder);
+          Builder.SetInsertPoint(Load);
+          Value *NewPtr = Builder.CreatePtrAdd(GEP->getPointerOperand(),
+                                               Builder.getInt(Offset));
+          auto *NewLoad = Builder.CreateAlignedLoad(
+              DestTy, NewPtr, commonAlignment(Load->getAlign(), ByteOffset));
+          AAMDNodes AATags = Load->getAAMetadata();
+          NewLoad->setAAMetadata(
+              AATags.adjustForAccess(ByteOffset, DestTy, DL));
+          NewLoad->copyMetadata(*Load,
+                                {LLVMContext::MD_invariant_load,
+                                 LLVMContext::MD_nontemporal,
+                                 LLVMContext::MD_mem_parallel_loop_access,
+                                 LLVMContext::MD_access_group});
+          return replaceInstUsesWith(Trunc, NewLoad);
+        }
+      }
+    }
+  }
 
   // Attempt to truncate the entire input expression tree to the destination
   // type.   Only do this if the dest type is a simple type, don't convert the
