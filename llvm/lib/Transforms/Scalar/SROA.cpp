@@ -109,6 +109,7 @@ STATISTIC(MaxUsesPerAllocaPartition, "Maximum number of uses of a partition");
 STATISTIC(NumNewAllocas, "Number of new, smaller allocas introduced");
 STATISTIC(NumPromoted, "Number of allocas promoted to SSA values");
 STATISTIC(NumLoadsSpeculated, "Number of loads speculated to allow promotion");
+STATISTIC(NumSwappingPHIsPromoted, "Number of swapping pointer PHIs promoted");
 STATISTIC(NumLoadsPredicated,
           "Number of loads rewritten into predicated loads to allow promotion");
 STATISTIC(
@@ -1676,6 +1677,212 @@ static bool isSafePHIToSpeculate(PHINode &PN) {
     return false;
   }
 
+  return true;
+}
+
+/// Check that direct data accesses to a slot are confined to Preheader. Within
+/// the loop it is accessed only through its PHI; its address must not escape,
+/// and its physical contents must not be observed after the loop.
+static bool isPrivateSwappingAlloca(AllocaInst &AI, PHINode &PN,
+                                   BasicBlock &Preheader) {
+  // The physical slots no longer receive the loop's stores. Leave their
+  // variable locations on the existing debug-info-aware promotion paths.
+  SmallVector<DbgVariableRecord *, 1> DbgUsers;
+  findDbgUsers(&PN, DbgUsers);
+  if (!DbgUsers.empty())
+    return false;
+  SmallVector<Value *, 4> Worklist{&AI};
+  while (!Worklist.empty()) {
+    Value *Ptr = Worklist.pop_back_val();
+    findDbgUsers(Ptr, DbgUsers);
+    if (!DbgUsers.empty())
+      return false;
+    for (Use &U : Ptr->uses()) {
+      auto *I = cast<Instruction>(U.getUser());
+      if (I == &PN)
+        continue;
+      if (auto *II = dyn_cast<IntrinsicInst>(I)) {
+        if (II->isLifetimeStartOrEnd()) {
+          if (II->getParent() == PN.getParent() ||
+              (II->getIntrinsicID() == Intrinsic::lifetime_end &&
+               II->getParent() == &Preheader))
+            return false;
+          continue;
+        }
+      }
+      if (I->getParent() != &Preheader)
+        return false;
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
+        Worklist.push_back(GEP);
+        continue;
+      }
+      if (auto *LI = dyn_cast<LoadInst>(I)) {
+        if (LI->isSimple() && (LI->getType()->isIntOrIntVectorTy() ||
+                              LI->getType()->isFPOrFPVectorTy()))
+          continue;
+      } else if (auto *SI = dyn_cast<StoreInst>(I)) {
+        if (SI->isSimple() && &U == &SI->getOperandUse(1) &&
+            (SI->getValueOperand()->getType()->isIntOrIntVectorTy() ||
+             SI->getValueOperand()->getType()->isFPOrFPVectorTy()))
+          continue;
+      } else if (auto *MI = dyn_cast<MemIntrinsic>(I)) {
+        if (!MI->isVolatile())
+          continue;
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+/// Replace a pair of swapping pointer PHIs in a single-block loop with PHIs
+/// for their contents. This is deliberately limited to two private integer
+/// slots of at most 16 bytes, full-slot loop accesses, and a preheader that
+/// executes at most once. SROA can then handle the initialization, including
+/// partial stores and memcpy, using its usual slicing and promotion machinery.
+static bool promoteSwappingAllocas(PHINode &PN) {
+  if (!PN.getType()->isPointerTy() || PN.getNumIncomingValues() != 2)
+    return false;
+  BasicBlock *BB = PN.getParent();
+  int BackedgeIdx = PN.getBasicBlockIndex(BB);
+  if (BackedgeIdx < 0)
+    return false;
+  auto *Other = dyn_cast<PHINode>(PN.getIncomingValue(BackedgeIdx));
+  if (!Other || Other == &PN || Other->getParent() != BB ||
+      Other->getNumIncomingValues() != 2 ||
+      Other->getIncomingValueForBlock(BB) != &PN)
+    return false;
+  BasicBlock *Preheader = PN.getIncomingBlock(1 - BackedgeIdx);
+  // Otherwise a subsequent execution of Preheader could observe the slots'
+  // physical contents, which are no longer updated by the loop.
+  BasicBlock *Entry = &BB->getParent()->getEntryBlock();
+  if (Preheader != Entry && Preheader->getSinglePredecessor() != Entry)
+    return false;
+  auto *PreheaderBr = dyn_cast<UncondBrInst>(Preheader->getTerminator());
+  auto *LoopBr = dyn_cast<CondBrInst>(BB->getTerminator());
+  if (!PreheaderBr || PreheaderBr->getSuccessor(0) != BB || !LoopBr ||
+      (LoopBr->getSuccessor(0) == BB) == (LoopBr->getSuccessor(1) == BB))
+    return false;
+
+  auto *A = dyn_cast<AllocaInst>(PN.getIncomingValue(1 - BackedgeIdx));
+  auto *B =
+      dyn_cast_or_null<AllocaInst>(Other->getIncomingValueForBlock(Preheader));
+  if (!A || !B || A == B || !A->isStaticAlloca() || !B->isStaticAlloca() ||
+      A->isUsedWithInAlloca() || B->isUsedWithInAlloca() || A->isSwiftError() ||
+      B->isSwiftError())
+    return false;
+  auto GetSlotType = [](AllocaInst *AI) -> Type * {
+    Type *Ty = AI->getAllocatedType();
+    while (auto *AT = dyn_cast<ArrayType>(Ty)) {
+      if (AT->getNumElements() != 1)
+        return nullptr;
+      Ty = AT->getElementType();
+    }
+    if (!Ty->isIntOrIntVectorTy() || isa<ScalableVectorType>(Ty))
+      return nullptr;
+    return Ty;
+  };
+  Type *Ty = GetSlotType(A);
+  if (!Ty || Ty != GetSlotType(B))
+    return false;
+  const DataLayout &DL = PN.getDataLayout();
+  TypeSize Size = DL.getTypeStoreSize(Ty);
+  if (Size.getFixedValue() > 16 || Ty->getScalarSizeInBits() % 8 != 0 ||
+      DL.getTypeSizeInBits(Ty) != Size * 8 ||
+      A->getAllocationSize(DL) != Size || B->getAllocationSize(DL) != Size ||
+      !isPrivateSwappingAlloca(*A, PN, *Preheader) ||
+      !isPrivateSwappingAlloca(*B, *Other, *Preheader))
+    return false;
+
+  // Check every use before making any changes. Calls may access unrelated
+  // memory, but may not receive either slot's address.
+  bool NeedsByteVector = false;
+  for (PHINode *Ptr : {&PN, Other}) {
+    bool HasAccess = false;
+    for (Use &U : Ptr->uses()) {
+      auto *I = cast<Instruction>(U.getUser());
+      if (I == (Ptr == &PN ? Other : &PN))
+        continue;
+      if (I->getParent() != BB)
+        return false;
+      HasAccess = true;
+      if (auto *LI = dyn_cast<LoadInst>(I)) {
+        if (LI->isSimple() && CastInst::isBitCastable(Ty, LI->getType()) &&
+            LI->getType()->getScalarSizeInBits() % 8 == 0) {
+          NeedsByteVector |= LI->getType() != Ty;
+          continue;
+        }
+      } else if (auto *SI = dyn_cast<StoreInst>(I)) {
+        if (SI->isSimple() && &U == &SI->getOperandUse(1) &&
+            CastInst::isBitCastable(SI->getValueOperand()->getType(), Ty) &&
+            SI->getValueOperand()->getType()->getScalarSizeInBits() % 8 == 0) {
+          NeedsByteVector |= SI->getValueOperand()->getType() != Ty;
+          continue;
+        }
+      } else if (auto *MT = dyn_cast<MemTransferInst>(I)) {
+        auto *Length = dyn_cast<ConstantInt>(MT->getLength());
+        if (!MT->isVolatile() && MT->getRawSource() == Ptr &&
+            MT->getRawDest() != &PN && MT->getRawDest() != Other && Length &&
+            Length->getValue() == Size.getFixedValue()) {
+          NeedsByteVector = true;
+          continue;
+        }
+      }
+      return false;
+    }
+    if (!HasAccess)
+      return false;
+  }
+
+  // A wide lane would spread poison to otherwise defined bytes when stored
+  // through a narrower vector type, or when copied as bytes. Keep those bytes
+  // separate across the backedge rather than widening them to the alloca type.
+  if (NeedsByteVector)
+    Ty = FixedVectorType::get(Type::getInt8Ty(PN.getContext()),
+                             Size.getFixedValue());
+
+  IRBuilderTy IRB(PreheaderBr);
+  Value *Initial[] = {
+      IRB.CreateAlignedLoad(Ty, A, A->getAlign(), PN.getName() + ".initial"),
+      IRB.CreateAlignedLoad(Ty, B, B->getAlign(), Other->getName() + ".initial")};
+  IRB.SetInsertPoint(&*BB->begin());
+  PHINode *Phis[] = {IRB.CreatePHI(Ty, 2, PN.getName() + ".sroa"),
+                    IRB.CreatePHI(Ty, 2, Other->getName() + ".sroa")};
+  Value *State[] = {Phis[0], Phis[1]};
+  for (Instruction &I : make_early_inc_range(*BB)) {
+    Value *Ptr = nullptr;
+    if (auto *LI = dyn_cast<LoadInst>(&I))
+      Ptr = LI->getPointerOperand();
+    else if (auto *SI = dyn_cast<StoreInst>(&I))
+      Ptr = SI->getPointerOperand();
+    else if (auto *MT = dyn_cast<MemTransferInst>(&I))
+      Ptr = MT->getRawSource();
+    if (Ptr != &PN && Ptr != Other)
+      continue;
+    unsigned Idx = Ptr == &PN ? 0 : 1;
+    IRB.SetInsertPoint(&I);
+    IRB.SetCurrentDebugLocation(I.getDebugLoc());
+    if (auto *LI = dyn_cast<LoadInst>(&I))
+      LI->replaceAllUsesWith(IRB.CreateBitCast(State[Idx], LI->getType(),
+                                             LI->getName() + ".value"));
+    else if (auto *SI = dyn_cast<StoreInst>(&I))
+      State[Idx] = IRB.CreateBitCast(SI->getValueOperand(), Ty);
+    else {
+      auto *MT = cast<MemTransferInst>(&I);
+      IRB.CreateAlignedStore(State[Idx], MT->getRawDest(),
+                            MT->getDestAlign().valueOrOne());
+    }
+    I.eraseFromParent();
+  }
+  for (unsigned Idx = 0; Idx != 2; ++Idx) {
+    Phis[Idx]->addIncoming(Initial[Idx], Preheader);
+    Phis[Idx]->addIncoming(State[1 - Idx], BB);
+  }
+  PN.dropAllReferences();
+  Other->dropAllReferences();
+  PN.eraseFromParent();
+  Other->eraseFromParent();
+  NumSwappingPHIsPromoted += 2;
   return true;
 }
 
@@ -6583,6 +6790,20 @@ bool SROA::promoteAllocas() {
 std::pair<bool /*Changed*/, bool /*CFGChanged*/> SROA::runSROA(Function &F) {
   LLVM_DEBUG(dbgs() << "SROA function: " << F.getName() << "\n");
 
+  bool Changed = false;
+  // Keep assignment tracking on the existing SROA paths for now.
+  if (!isAssignmentTrackingEnabled(*F.getParent())) {
+    for (BasicBlock &BB : F) {
+      SmallVector<WeakTrackingVH, 4> Candidates;
+      for (PHINode &PN : BB.phis())
+        if (PN.getType()->isPointerTy())
+          Candidates.push_back(&PN);
+      for (WeakTrackingVH &Candidate : Candidates)
+        if (auto *PN = dyn_cast_or_null<PHINode>(Candidate))
+          Changed |= promoteSwappingAllocas(*PN);
+    }
+  }
+
   const DataLayout &DL = F.getDataLayout();
   BasicBlock &EntryBB = F.getEntryBlock();
   for (BasicBlock::iterator I = EntryBB.begin(), E = std::prev(EntryBB.end());
@@ -6596,7 +6817,6 @@ std::pair<bool /*Changed*/, bool /*CFGChanged*/> SROA::runSROA(Function &F) {
     }
   }
 
-  bool Changed = false;
   bool CFGChanged = false;
   // A set of deleted alloca instruction pointers which should be removed from
   // the list of promotable allocas.
